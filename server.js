@@ -22,7 +22,7 @@ const io = new Server(server, {
 
 // MIDDLEWARE
 app.use(cors());
-app.use(express.json({ limit: "10kb" }));
+app.use(express.json({ limit: "10mb" }));
 
 // MYSQL CONNECTION POOL
 const pool = mysql.createPool({
@@ -196,7 +196,7 @@ function startSimulation(deviceId, batteryOverride = null) {
     };
 
     try {
-      await axios.post("http://192.168.0.101:3000/data", payload);
+      await axios.post("http://192.168.254.101:3000/data", payload);
       console.log(`🧪 Sent simulated data for ${deviceId}:`, payload);
     } catch (err) {
       console.error(
@@ -238,6 +238,45 @@ app.post("/simulate-movement", (req, res) => {
     return res.status(200).json({
       message: `Stopped simulation for: ${deviceIds.join(", ")}`,
     });
+  }
+});
+
+// SAVE TRACKER 
+app.post("/api/trackers", async (req, res) => {
+  let connection;
+  try {
+    const { device_id, user_id, pet_name, pet_image, pet_type, pet_breed } =
+      req.body;
+
+    if (!device_id || !user_id || !pet_name || !pet_type || !pet_breed) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    let imageBuffer = null;
+    if (pet_image && typeof pet_image === "string") {
+      const base64Data = pet_image.includes("base64,")
+        ? pet_image.split("base64,")[1]
+        : pet_image;
+      imageBuffer = Buffer.from(base64Data, "base64");
+    }
+
+    connection = await pool.getConnection();
+
+    await connection.query(
+      `
+      INSERT INTO trackers (
+        device_id, user_id, pet_name, pet_image, pet_type, pet_breed, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NOW())
+    `,
+      [device_id, user_id, pet_name, imageBuffer, pet_type, pet_breed]
+    );
+
+    return res.status(201).json({ message: "Tracker saved successfully" });
+  } catch (err) {
+    console.error("❌ Error saving tracker:", err.message);
+    return res.status(500).json({ message: "Failed to save tracker" });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
