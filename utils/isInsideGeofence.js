@@ -41,18 +41,23 @@ function isInsideGeofence(deviceLat, deviceLng, geofences) {
     if ((type === "polygon" || type === "rectangle") && fence.poly_rect) {
       try {
         const coords = JSON.parse(fence.poly_rect);
-        if (coords.length < 3) continue;
+        if (!Array.isArray(coords) || coords.length < 3) continue;
 
-        const polygon = turf.polygon([[...coords, coords[0]]]);
+        const geoJsonCoords = coords.map(([lat, lng]) => [lng, lat]);
+        geoJsonCoords.push(geoJsonCoords[0]);
+
+        const polygon = turf.polygon([geoJsonCoords]);
 
         if (turf.booleanPointInPolygon(point, polygon)) {
           isInsideAny = true;
           break;
         }
 
-        const distance = turf.pointToLineDistance(point, polygon, {
+        const line = turf.lineString(geoJsonCoords);
+        const distance = turf.pointToLineDistance(point, line, {
           units: "meters",
         });
+
         if (distance < minDistance) minDistance = distance;
       } catch (err) {
         console.warn("⚠️ Invalid polygon for geofence:", err.message);

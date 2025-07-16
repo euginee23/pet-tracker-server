@@ -114,7 +114,12 @@ app.post("/data", async (req, res) => {
 
     connection = await pool.getConnection();
     const [geofences] = await connection.query(
-      "SELECT * FROM geofences WHERE device_id = ?",
+      `
+        SELECT g.*
+        FROM geofences g
+        JOIN geofence_assignment ga ON g.geofence_id = ga.geofence_id
+        WHERE ga.device_id = ?
+      `,
       [data.deviceId]
     );
 
@@ -126,7 +131,7 @@ app.post("/data", async (req, res) => {
       const result = isInsideGeofence(data.lat, data.lng, geofences);
       if (!result.isInside) {
         console.warn(
-          `⚠️ Pet ${data.deviceId} is OUTSIDE all geofences! (~${result.distance}m away)`
+          `⚠️ Pet ${data.deviceId} is OUTSIDE its assigned geofences (~${result.distance}m away)`
         );
       } else {
         console.log(`✅ Pet ${data.deviceId} is INSIDE a geofence.`);
@@ -144,7 +149,7 @@ app.post("/data", async (req, res) => {
   }
 });
 
-// OFFLINE CHECK
+// DEVICE GOES OFFLINE
 setInterval(() => {
   const now = Date.now();
 
@@ -153,6 +158,27 @@ setInterval(() => {
     if (isOffline && deviceStatus[deviceId] !== "offline") {
       console.log(`🔴 ${deviceId} is now OFFLINE`);
       deviceStatus[deviceId] = "offline";
+
+      (async () => {
+        let connection;
+        try {
+          connection = await pool.getConnection();
+          await connection.query(
+            `UPDATE trackers 
+         SET last_battery = ?, last_lat = ?, last_lng = ? 
+         WHERE device_id = ?`,
+            [info.battery ?? null, info.lat ?? null, info.lng ?? null, deviceId]
+          );
+          console.log(`📦 Saved last known data for ${deviceId}`);
+        } catch (err) {
+          console.error(
+            `❌ Failed to save last data for ${deviceId}:`,
+            err.message
+          );
+        } finally {
+          if (connection) connection.release();
+        }
+      })();
     }
   }
 
@@ -197,7 +223,6 @@ function startSimulation(deviceId, batteryOverride = null) {
 
     try {
       await axios.post("http://192.168.254.101:3000/data", payload);
-      console.log(`🧪 Sent simulated data for ${deviceId}:`, payload);
     } catch (err) {
       console.error(
         `❌ Failed to send simulated data for ${deviceId}:`,
@@ -241,7 +266,7 @@ app.post("/simulate-movement", (req, res) => {
   }
 });
 
-// SAVE TRACKER 
+// SAVE TRACKER
 app.post("/api/trackers", async (req, res) => {
   let connection;
   try {
@@ -280,13 +305,39 @@ app.post("/api/trackers", async (req, res) => {
   }
 });
 
+// GET ALL TRACKERS FOR A USER
+app.get("/api/trackers/:userId", async (req, res) => {
+  let connection;
+  try {
+    const { userId } = req.params;
+
+    connection = await pool.getConnection();
+
+    const [rows] = await connection.query(
+      `SELECT device_id, pet_name, pet_type, pet_breed, 
+              TO_BASE64(pet_image) AS pet_image 
+       FROM trackers 
+       WHERE user_id = ?`,
+      [userId]
+    );
+
+    res.status(200).json(rows);
+  } catch (err) {
+    console.error("❌ Error fetching trackers:", err.message);
+    res.status(500).json({ message: "Failed to fetch trackers" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 // SAVE GEOFENCE
 app.post("/api/geofences", async (req, res) => {
   let connection;
   try {
     const {
       user_id,
-      device_id,
+      device_ids,
+      geofence_name,
       type,
       center_lat,
       center_lng,
@@ -296,10 +347,15 @@ app.post("/api/geofences", async (req, res) => {
 
     console.log("📍 Geofence save request:", req.body);
 
-    if (!user_id || !device_id || !type) {
+    if (
+      !user_id ||
+      !Array.isArray(device_ids) ||
+      device_ids.length === 0 ||
+      !type
+    ) {
       return res
         .status(400)
-        .json({ message: "user_id, device_id, and type are required" });
+        .json({ message: "user_id, device_ids[], and type are required" });
     }
 
     if (
@@ -313,23 +369,20 @@ app.post("/api/geofences", async (req, res) => {
         .json({ message: "Missing center or radius for circle geofence" });
     }
 
-    if (type === "polygon" && !poly_rect) {
-      return res
-        .status(400)
-        .json({ message: "Missing polygon coordinates for polygon geofence" });
+    if ((type === "polygon" || type === "rectangle") && !poly_rect) {
+      return res.status(400).json({
+        message: "Missing coordinates for polygon/rectangle geofence",
+      });
     }
 
     connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-    await connection.query(
-      `
-      INSERT INTO geofences 
-        (user_id, device_id, type, center_lat, center_lng, radius, poly_rect, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
-    `,
+    const [geofenceResult] = await connection.query(
+      `INSERT INTO geofences (geofence_name, type, center_lat, center_lng, radius, poly_rect, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
       [
-        user_id,
-        device_id,
+        geofence_name || null,
         type,
         center_lat || null,
         center_lng || null,
@@ -338,9 +391,31 @@ app.post("/api/geofences", async (req, res) => {
       ]
     );
 
-    console.log(`✅ Geofence saved for ${device_id} (${type})`);
+    const geofence_id = geofenceResult.insertId;
+
+    const assignmentInserts = device_ids.map((device_id) => [
+      geofence_id,
+      device_id,
+      user_id,
+      new Date(),
+    ]);
+
+    await connection.query(
+      `INSERT INTO geofence_assignment (geofence_id, device_id, user_id, created_at)
+       VALUES ?`,
+      [assignmentInserts]
+    );
+
+    await connection.commit();
+
+    console.log(
+      `✅ Geofence ${geofence_id} saved and assigned to devices: ${device_ids.join(
+        ", "
+      )}`
+    );
     return res.status(201).json({ message: "Geofence saved successfully" });
   } catch (err) {
+    if (connection) await connection.rollback();
     console.error("❌ Geofence save error:", err.message);
     return res.status(500).json({ message: "Failed to save geofence" });
   } finally {
@@ -352,20 +427,159 @@ app.post("/api/geofences", async (req, res) => {
   }
 });
 
-// GET ALL GEOFENCES FOR USER
+// DELETE GEOFENCE
+app.delete("/api/geofences/delete/:geofenceId", async (req, res) => {
+  let connection;
+  try {
+    const { geofenceId } = req.params;
+    const deviceIdsRaw = req.query.deviceIds;
+
+    const deviceIds = Array.isArray(deviceIdsRaw)
+      ? deviceIdsRaw
+      : typeof deviceIdsRaw === "string"
+      ? deviceIdsRaw.split(",").filter((d) => d.trim() !== "")
+      : [];
+
+    if (!geofenceId) {
+      return res.status(400).json({ message: "Geofence ID is required" });
+    }
+
+    if (deviceIds.length === 0) {
+      return res.status(400).json({ message: "Device IDs are required" });
+    }
+
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [deleteResult] = await connection.query(
+      `
+      DELETE FROM geofence_assignment 
+      WHERE geofence_id = ? AND device_id IN (?)
+    `,
+      [geofenceId, deviceIds]
+    );
+
+    if (deleteResult.affectedRows === 0) {
+      await connection.rollback();
+      return res
+        .status(404)
+        .json({ message: "No matching geofence-device links found" });
+    }
+
+    const [remaining] = await connection.query(
+      `SELECT COUNT(*) as count FROM geofence_assignment WHERE geofence_id = ?`,
+      [geofenceId]
+    );
+
+    if (remaining[0].count === 0) {
+      await connection.query(`DELETE FROM geofences WHERE geofence_id = ?`, [
+        geofenceId,
+      ]);
+    }
+
+    await connection.commit();
+    return res.status(200).json({
+      message: `Deleted ${deleteResult.affectedRows} device assignment(s)`,
+    });
+  } catch (err) {
+    console.error("❌ Error deleting geofence:", err.message);
+    if (connection) await connection.rollback();
+    return res.status(500).json({ message: "Failed to delete geofence(s)" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// GET GEOFENCE FOR A USER
 app.get("/api/geofences/:userId", async (req, res) => {
   let connection;
   try {
     const userId = req.params.userId;
-
     connection = await pool.getConnection();
 
     const [rows] = await connection.query(
-      "SELECT * FROM geofences WHERE user_id = ?",
+      `
+      SELECT
+        g.geofence_id,
+        g.geofence_name,
+        g.type,
+        g.center_lat,
+        g.center_lng,
+        g.radius,
+        g.poly_rect,
+        ga.device_id,
+        t.pet_name
+      FROM geofences g
+      JOIN geofence_assignment ga ON g.geofence_id = ga.geofence_id
+      LEFT JOIN trackers t ON ga.device_id = t.device_id
+      WHERE ga.user_id = ?
+      `,
       [userId]
     );
 
-    return res.status(200).json(rows);
+    const geofenceMap = {};
+
+    for (const row of rows) {
+      const geofenceId = row.geofence_id;
+
+      const type = row.type?.toLowerCase();
+      let isValid = false;
+
+      if (type === "circle") {
+        isValid =
+          typeof row.center_lat === "number" &&
+          typeof row.center_lng === "number" &&
+          typeof row.radius === "number" &&
+          !isNaN(row.center_lat) &&
+          !isNaN(row.center_lng) &&
+          !isNaN(row.radius);
+      } else if (type === "polygon" || type === "rectangle") {
+        try {
+          const parsed = JSON.parse(row.poly_rect || "[]");
+          isValid =
+            Array.isArray(parsed) &&
+            parsed.length >= 3 &&
+            parsed.every(
+              (pt) =>
+                Array.isArray(pt) &&
+                typeof pt[0] === "number" &&
+                typeof pt[1] === "number" &&
+                !isNaN(pt[0]) &&
+                !isNaN(pt[1])
+            );
+        } catch {
+          isValid = false;
+        }
+      }
+
+      if (!isValid) {
+        console.warn(`⚠️ Skipping invalid geofence_id ${geofenceId}`);
+        continue;
+      }
+
+      if (!geofenceMap[geofenceId]) {
+        geofenceMap[geofenceId] = {
+          geofence_id: geofenceId,
+          geofence_name: row.geofence_name,
+          type: row.type,
+          center_lat: row.center_lat,
+          center_lng: row.center_lng,
+          radius: row.radius,
+          poly_rect: row.poly_rect,
+          deviceIds: [],
+          deviceNames: [],
+        };
+      }
+
+      if (row.device_id?.trim()) {
+        geofenceMap[geofenceId].deviceIds.push(row.device_id.trim());
+        geofenceMap[geofenceId].deviceNames.push(
+          row.pet_name?.trim() || "(Unnamed)"
+        );
+      }
+    }
+
+    return res.status(200).json(Object.values(geofenceMap));
   } catch (err) {
     console.error("❌ Error fetching geofences:", err.message);
     return res.status(500).json({ message: "Failed to fetch geofences" });
