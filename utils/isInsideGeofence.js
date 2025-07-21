@@ -23,12 +23,6 @@ function isInsideGeofence(deviceLat, deviceLng, geofences) {
         units: "meters",
       });
 
-      console.log(
-        `📏 Circle check for ${
-          fence.device_id
-        }: dist=${distanceToCenter.toFixed(2)}m, radius=${radius}`
-      );
-
       if (distanceToCenter <= radius) {
         isInsideAny = true;
         break;

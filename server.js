@@ -112,14 +112,17 @@ app.post("/data", async (req, res) => {
       deviceStatus[data.deviceId] = "online";
     }
 
+    if (!global.lastGeofenceState) global.lastGeofenceState = {};
+    const lastState = global.lastGeofenceState[data.deviceId] || [];
+
     connection = await pool.getConnection();
     const [geofences] = await connection.query(
       `
-        SELECT g.*
-        FROM geofences g
-        JOIN geofence_assignment ga ON g.geofence_id = ga.geofence_id
-        WHERE ga.device_id = ?
-      `,
+    SELECT g.*
+    FROM geofences g
+    JOIN geofence_assignment ga ON g.geofence_id = ga.geofence_id
+    WHERE ga.device_id = ?
+  `,
       [data.deviceId]
     );
 
@@ -128,14 +131,46 @@ app.post("/data", async (req, res) => {
         `ℹ️ No geofences set for ${data.deviceId}. Skipping geofence check.`
       );
     } else {
-      const result = isInsideGeofence(data.lat, data.lng, geofences);
-      if (!result.isInside) {
-        console.warn(
-          `⚠️ Pet ${data.deviceId} is OUTSIDE its assigned geofences (~${result.distance}m away)`
-        );
-      } else {
-        console.log(`✅ Pet ${data.deviceId} is INSIDE a geofence.`);
+      if (!global.lastGeofenceState) global.lastGeofenceState = {};
+      const lastState = global.lastGeofenceState[data.deviceId] || [];
+
+      const insideGeofences = [];
+      const geofenceDistances = [];
+      for (const geofence of geofences) {
+        const result = isInsideGeofence(data.lat, data.lng, [geofence]);
+        if (result.isInside) {
+          insideGeofences.push(geofence.geofence_id);
+        }
+        geofenceDistances.push({
+          geofenceId: geofence.geofence_id,
+          geofenceName: geofence.geofence_name || geofence.geofence_id,
+          distance: result.distance
+        });
       }
+
+      for (const geofence of geofences) {
+        const geofenceId = geofence.geofence_id;
+        const geofenceName = geofence.geofence_name || geofenceId;
+        const wasInside = lastState.includes(geofenceId);
+        const isNowInside = insideGeofences.includes(geofenceId);
+        const distObj = geofenceDistances.find(gd => gd.geofenceId === geofenceId);
+        if (!wasInside && isNowInside) {
+          console.log(`✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`);
+        } else if (wasInside && isNowInside) {
+          console.log(`✅ Pet ${data.deviceId} is inside geofence (${geofenceName})`);
+        } else if (wasInside && !isNowInside) {
+          console.warn(`⚠️ Pet ${data.deviceId} is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(2)}m away)`);
+        }
+      }
+
+      if (insideGeofences.length === 0) {
+        const distMsg = geofenceDistances
+          .map(gd => `${gd.geofenceName} ~${gd.distance.toFixed(2)}m`)
+          .join(", ");
+        console.warn(`⚠️ Pet ${data.deviceId} is now outside all geofences: ${distMsg}`);
+      }
+
+      global.lastGeofenceState[data.deviceId] = insideGeofences;
     }
 
     console.log("📥 Received from device:", data);
@@ -222,7 +257,7 @@ function startSimulation(deviceId, batteryOverride = null) {
     };
 
     try {
-      await axios.post("http://192.168.254.101:3000/data", payload);
+      await axios.post("http://192.168.254.107:3000/data", payload);
     } catch (err) {
       console.error(
         `❌ Failed to send simulated data for ${deviceId}:`,
@@ -315,7 +350,10 @@ app.get("/api/trackers/:userId", async (req, res) => {
 
     const [rows] = await connection.query(
       `SELECT device_id, pet_name, pet_type, pet_breed, 
-              TO_BASE64(pet_image) AS pet_image 
+              TO_BASE64(pet_image) AS pet_image,
+              COALESCE(last_lat, 0) AS last_lat,
+              COALESCE(last_lng, 0) AS last_lng,
+              COALESCE(last_battery, 0) AS last_battery
        FROM trackers 
        WHERE user_id = ?`,
       [userId]
