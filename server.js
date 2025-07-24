@@ -263,7 +263,7 @@ function startSimulation(deviceId, batteryOverride = null) {
     };
 
     try {
-      await axios.post(`${process.env.SERVER_URL}/:3000/data`, payload);
+      await axios.post(`${process.env.SERVER_URL}:3000/data`, payload);
     } catch (err) {
       console.error(
         `❌ Failed to send simulated data for ${deviceId}:`,
