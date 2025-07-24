@@ -10,6 +10,7 @@ const axios = require("axios");
 require("dotenv").config();
 
 const isInsideGeofence = require("./utils/isInsideGeofence");
+const { sendSMS } = require("./utils/sms");
 
 const app = express();
 const server = http.createServer(app);
@@ -110,6 +111,11 @@ app.post("/data", async (req, res) => {
     if (deviceStatus[data.deviceId] !== "online") {
       console.log(`🟢 ${data.deviceId} is now ONLINE`);
       deviceStatus[data.deviceId] = "online";
+      // TEST SMS
+       await sendSMS({
+         number: '09490161595',
+         message: `Device ${data.deviceId} is now ONLINE.`
+       });
     }
 
     if (!global.lastGeofenceState) global.lastGeofenceState = {};
@@ -257,7 +263,7 @@ function startSimulation(deviceId, batteryOverride = null) {
     };
 
     try {
-      await axios.post("http://192.168.254.107:3000/data", payload);
+      await axios.post(`${process.env.SERVER_URL}/:3000/data`, payload);
     } catch (err) {
       console.error(
         `❌ Failed to send simulated data for ${deviceId}:`,
