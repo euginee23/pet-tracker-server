@@ -1,7 +1,6 @@
 const express = require("express");
 const http = require("http");
 
-// We'll use http instead of https since Nginx is handling SSL
 // const https = require("https");
 // const fs = require("fs");
 
@@ -39,28 +38,27 @@ const server = http.createServer(app);
 
 const io = require("socket.io")(server, {
   cors: {
-    origin: '*',  // Set to * to allow access from any origin
+    origin: '*',
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"],
     credentials: true
   },
-  // Ensure compatibility with proxies
   path: '/socket.io',
-  transports: ['websocket', 'polling'],
+  transports: ['polling', 'websocket'],
   allowUpgrades: true,
   pingTimeout: 60000,
-  pingInterval: 25000
+  pingInterval: 25000,
+  cookie: false,  
+  perMessageDeflate: false  
 });
 
 // MIDDLEWARE
-// Add CORS headers directly as middleware for maximum compatibility
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');  // Allow all origins
+  res.header('Access-Control-Allow-Origin', '*');  
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   res.header('Access-Control-Allow-Credentials', 'true');
   
-  // Handle preflight OPTIONS requests
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
@@ -309,7 +307,9 @@ function startSimulation(deviceId, batteryOverride = null) {
     };
 
     try {
-      await axios.post(`${process.env.SERVER_URL}:3000/data`, payload);
+      // Use the full URL without appending port (the port is handled by Nginx)
+      const serverUrl = process.env.SERVER_URL || 'http://localhost:3000';
+      await axios.post(`${serverUrl}/data`, payload);
     } catch (err) {
       console.error(
         `❌ Failed to send simulated data for ${deviceId}:`,
