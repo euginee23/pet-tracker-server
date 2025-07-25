@@ -1,8 +1,9 @@
 const express = require("express");
-// const http = require("http");
+const http = require("http");
 
-const https = require("https");
-const fs = require("fs");
+// We'll use http instead of https since Nginx is handling SSL
+// const https = require("https");
+// const fs = require("fs");
 
 const cors = require("cors");
 //const { Server } = require("socket.io");
@@ -18,7 +19,8 @@ const { sendSMS } = require("./utils/sms");
 
 const app = express();
 
-// const server = http.createServer(app);
+// Use HTTP server since Nginx is handling SSL
+const server = http.createServer(app);
 // const io = new Server(server, {
 //   cors: {
 //     origin: "*",
@@ -26,30 +28,47 @@ const app = express();
 //   },
 // });
 
-const server = https.createServer(
-  {
-    key: fs.readFileSync("/etc/letsencrypt/live/api.pet-tracker.codehub.site/privkey.pem"),
-    cert: fs.readFileSync("/etc/letsencrypt/live/api.pet-tracker.codehub.site/fullchain.pem"),
-  },
-  app
-);
+// No need for HTTPS server as Nginx is handling SSL
+// const server = https.createServer(
+//   {
+//     key: fs.readFileSync("/etc/letsencrypt/live/api.pet-tracker.codehub.site/privkey.pem"),
+//     cert: fs.readFileSync("/etc/letsencrypt/live/api.pet-tracker.codehub.site/fullchain.pem"),
+//   },
+//   app
+// );
 
 const io = require("socket.io")(server, {
   cors: {
-    origin: ['https://pet-tracker.codehub.site', 'http://localhost:3000', 'http://localhost:5173'],
+    origin: '*',  // Set to * to allow access from any origin
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"],
     credentials: true
   },
+  // Ensure compatibility with proxies
+  path: '/socket.io',
+  transports: ['websocket', 'polling'],
+  allowUpgrades: true,
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // MIDDLEWARE
-app.use(cors({
-  origin: ['https://pet-tracker.codehub.site', 'http://localhost:3000', 'http://localhost:5173'],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
+// Add CORS headers directly as middleware for maximum compatibility
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');  // Allow all origins
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
+  // Handle preflight OPTIONS requests
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  next();
+});
+
+// Use simpler CORS settings
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 // MYSQL CONNECTION POOL
