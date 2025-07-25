@@ -11,6 +11,7 @@ require("dotenv").config();
 
 const isInsideGeofence = require("./utils/isInsideGeofence");
 const { sendSMS } = require("./utils/sms");
+const notificationHelper = require("./utils/notifications");
 
 const app = express();
 const server = http.createServer(app);
@@ -43,6 +44,9 @@ const pool = mysql.createPool({
     const connection = await pool.getConnection();
     console.log("✅ Successfully connected to the database.");
     connection.release();
+    
+    // Initialize the notification helper with our pool
+    notificationHelper.initialize(pool);
   } catch (err) {
     console.error("❌ Error connecting to the database:", err.message || err);
   }
@@ -111,11 +115,54 @@ app.post("/data", async (req, res) => {
     if (deviceStatus[data.deviceId] !== "online") {
       console.log(`🟢 ${data.deviceId} is now ONLINE`);
       deviceStatus[data.deviceId] = "online";
-      // TEST SMS
-       await sendSMS({
-         number: '09490161595',
-         message: `Device ${data.deviceId} is now ONLINE.`
-       });
+      
+      // Find all users who own this device
+      try {
+        connection = await pool.getConnection();
+        const [trackers] = await connection.query(
+          `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
+          [data.deviceId]
+        );
+        connection.release();
+        
+        // Create notifications for each user
+        for (const tracker of trackers) {
+          const petName = tracker.pet_name || "Your pet";
+          const message = `${petName}'s tracker (${data.deviceId}) is now ONLINE`;
+          
+          await notificationHelper.createNotification(
+            io,
+            tracker.user_id, 
+            data.deviceId, 
+            message,
+            'normal'
+          );
+        }
+      } catch (notifError) {
+        console.error(`❌ Error creating online notification:`, notifError);
+      }
+      
+      // SMS NOTIFICATION COMMENTED OUT DUE TO SEMAPHORE API ISSUES
+      /*
+      try {
+        let phoneNumber = '09490161595';
+        
+        if (phoneNumber.startsWith('0')) {
+          phoneNumber = '63' + phoneNumber.substring(1);
+        }
+        
+        console.log(`📱 Attempting to send SMS notification for device ${data.deviceId} to ${phoneNumber}`);
+        
+        const smsResponse = await sendSMS({
+          number: phoneNumber,
+          message: `Device ${data.deviceId} is now ONLINE. Time: ${new Date().toLocaleString()}`
+        });
+        
+        console.log(`✅ SMS notification sent for device ${data.deviceId}`, smsResponse);
+      } catch (smsError) {
+        console.error(`❌ Failed to send SMS notification:`, smsError.message);
+      }
+      */
     }
 
     if (!global.lastGeofenceState) global.lastGeofenceState = {};
@@ -154,18 +201,48 @@ app.post("/data", async (req, res) => {
         });
       }
 
+      // Get pet name for notifications
+      const [trackerInfo] = await connection.query(
+        `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
+        [data.deviceId]
+      );
+        
       for (const geofence of geofences) {
         const geofenceId = geofence.geofence_id;
         const geofenceName = geofence.geofence_name || geofenceId;
         const wasInside = lastState.includes(geofenceId);
         const isNowInside = insideGeofences.includes(geofenceId);
         const distObj = geofenceDistances.find(gd => gd.geofenceId === geofenceId);
-        if (!wasInside && isNowInside) {
-          console.log(`✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`);
-        } else if (wasInside && isNowInside) {
-          console.log(`✅ Pet ${data.deviceId} is inside geofence (${geofenceName})`);
-        } else if (wasInside && !isNowInside) {
-          console.warn(`⚠️ Pet ${data.deviceId} is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(2)}m away)`);
+        
+        // For each tracker associated with this device
+        for (const tracker of trackerInfo) {
+          const petName = tracker.pet_name || "Your pet";
+          
+          if (!wasInside && isNowInside) {
+            console.log(`✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`);
+            
+            // Create "entered geofence" notification
+            await notificationHelper.createNotification(
+              io,
+              tracker.user_id,
+              data.deviceId,
+              `${petName} has entered the "${geofenceName}" geofence zone`,
+              'normal'
+            );
+          } else if (wasInside && isNowInside) {
+            console.log(`✅ Pet ${data.deviceId} is inside geofence (${geofenceName})`);
+          } else if (wasInside && !isNowInside) {
+            console.warn(`⚠️ Pet ${data.deviceId} is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(2)}m away)`);
+            
+            // Create "left geofence" notification
+            await notificationHelper.createNotification(
+              io,
+              tracker.user_id,
+              data.deviceId,
+              `⚠️ ${petName} has left the "${geofenceName}" geofence zone!`,
+              'alert' 
+            );
+          }
         }
       }
 
@@ -204,6 +281,8 @@ setInterval(() => {
         let connection;
         try {
           connection = await pool.getConnection();
+          
+          // Update the tracker's last known data
           await connection.query(
             `UPDATE trackers 
          SET last_battery = ?, last_lat = ?, last_lng = ? 
@@ -211,9 +290,29 @@ setInterval(() => {
             [info.battery ?? null, info.lat ?? null, info.lng ?? null, deviceId]
           );
           console.log(`📦 Saved last known data for ${deviceId}`);
+          
+          // Get all users who have this tracker
+          const [trackers] = await connection.query(
+            `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
+            [deviceId]
+          );
+          
+          // Create notifications for each user
+          for (const tracker of trackers) {
+            const petName = tracker.pet_name || "Your pet";
+            const message = `${petName}'s tracker (${deviceId}) has gone OFFLINE`;
+            
+            await notificationHelper.createNotification(
+              io,
+              tracker.user_id, 
+              deviceId, 
+              message,
+              'offline' // Use the offline sound
+            );
+          }
         } catch (err) {
           console.error(
-            `❌ Failed to save last data for ${deviceId}:`,
+            `❌ Failed to process offline device ${deviceId}:`,
             err.message
           );
         } finally {
@@ -963,6 +1062,112 @@ app.post("/api/user-profile", async (req, res) => {
     } catch (e) {
       console.warn("Failed to release MySQL connection:", e.message);
     }
+  }
+});
+
+// GET ALL NOTIFICATIONS
+app.get("/api/notifications", async (req, res) => {
+  let connection;
+  try {
+    const userId = req.query.userId;
+    
+    connection = await pool.getConnection();
+    
+    let query = `SELECT notification_id as id, user_id, device_id, message, created_at, is_read 
+                FROM notifications`;
+    
+    const params = [];
+    if (userId) {
+      query += ` WHERE user_id = ?`;
+      params.push(userId);
+    }
+    
+    query += ` ORDER BY created_at DESC LIMIT 50`;
+    
+    const [notifications] = await connection.query(query, params);
+    
+    return res.status(200).json(notifications);
+  } catch (err) {
+    console.error("❌ Error fetching notifications:", err.message);
+    return res.status(500).json({ message: "Failed to fetch notifications" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// MARK NOTIFICATION AS READ
+app.put("/api/notifications/:notificationId/read", async (req, res) => {
+  let connection;
+  try {
+    const { notificationId } = req.params;
+    
+    connection = await pool.getConnection();
+    
+    await connection.query(
+      `UPDATE notifications SET is_read = 1 WHERE notification_id = ?`,
+      [notificationId]
+    );
+    
+    return res.status(200).json({ message: "Notification marked as read" });
+  } catch (err) {
+    console.error("❌ Error marking notification as read:", err.message);
+    return res.status(500).json({ message: "Failed to mark notification as read" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// MARK ALL NOTIFICATIONS AS READ
+app.put("/api/notifications/mark-all-read", async (req, res) => {
+  let connection;
+  try {
+    const userId = req.query.userId;
+    
+    connection = await pool.getConnection();
+    
+    let query = `UPDATE notifications SET is_read = 1`;
+    const params = [];
+    
+    if (userId) {
+      query += ` WHERE user_id = ?`;
+      params.push(userId);
+    }
+    
+    await connection.query(query, params);
+    
+    return res.status(200).json({ message: "All notifications marked as read" });
+  } catch (err) {
+    console.error("❌ Error marking all notifications as read:", err.message);
+    return res.status(500).json({ message: "Failed to mark all notifications as read" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// CLEAR ALL NOTIFICATIONS
+app.delete("/api/notifications/clear-all", async (req, res) => {
+  let connection;
+  try {
+    const userId = req.query.userId;
+    
+    connection = await pool.getConnection();
+    
+    let query = `DELETE FROM notifications`;
+    const params = [];
+    
+    if (userId) {
+      query += ` WHERE user_id = ?`;
+      params.push(userId);
+    }
+    
+    await connection.query(query, params);
+    
+    return res.status(200).json({ message: "All notifications cleared" });
+  } catch (err) {
+    console.error("❌ Error clearing notifications:", err.message);
+    return res.status(500).json({ message: "Failed to clear notifications" });
+  } finally {
+    if (connection) connection.release();
   }
 });
 

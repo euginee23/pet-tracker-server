@@ -1,9 +1,11 @@
 {
   "name": "pet-tracker-server",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "generate-ssl": "cd ssl && openssl genrsa -out privatekey.pem 2048 && openssl req -new -x509 -key privatekey.pem -out certificate.pem -days 365"
   },
   "keywords": [],
   "author": "",
