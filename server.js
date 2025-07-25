@@ -1,11 +1,7 @@
 const express = require("express");
 const http = require("http");
-
-// const https = require("https");
-// const fs = require("fs");
-
 const cors = require("cors");
-//const { Server } = require("socket.io");
+const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
 const bcrypt = require("bcrypt");
 const nodemailer = require("nodemailer");
@@ -17,55 +13,15 @@ const isInsideGeofence = require("./utils/isInsideGeofence");
 const { sendSMS } = require("./utils/sms");
 
 const app = express();
-
-// Use HTTP server since Nginx is handling SSL
 const server = http.createServer(app);
-// const io = new Server(server, {
-//   cors: {
-//     origin: "*",
-//     methods: ["GET", "POST"],
-//   },
-// });
-
-// No need for HTTPS server as Nginx is handling SSL
-// const server = https.createServer(
-//   {
-//     key: fs.readFileSync("/etc/letsencrypt/live/api.pet-tracker.codehub.site/privkey.pem"),
-//     cert: fs.readFileSync("/etc/letsencrypt/live/api.pet-tracker.codehub.site/fullchain.pem"),
-//   },
-//   app
-// );
-
-const io = require("socket.io")(server, {
+const io = new Server(server, {
   cors: {
-    origin: '*',
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"],
-    credentials: true
+    origin: "*",
+    methods: ["GET", "POST"],
   },
-  path: '/socket.io',
-  transports: ['polling', 'websocket'],
-  allowUpgrades: true,
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  cookie: false,  
-  perMessageDeflate: false  
 });
 
 // MIDDLEWARE
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');  
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  next();
-});
-
-// Use simpler CORS settings
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
@@ -307,9 +263,7 @@ function startSimulation(deviceId, batteryOverride = null) {
     };
 
     try {
-      // Use the full URL without appending port (the port is handled by Nginx)
-      const serverUrl = process.env.SERVER_URL || 'http://localhost:3000';
-      await axios.post(`${serverUrl}/data`, payload);
+      await axios.post(`${process.env.SERVER_URL}:3000/data`, payload);
     } catch (err) {
       console.error(
         `❌ Failed to send simulated data for ${deviceId}:`,
