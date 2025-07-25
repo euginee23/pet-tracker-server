@@ -1,7 +1,11 @@
 const express = require("express");
-const http = require("http");
+// const http = require("http");
+
+const https = require("https");
+const fs = require("fs");
+
 const cors = require("cors");
-const { Server } = require("socket.io");
+//const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
 const bcrypt = require("bcrypt");
 const nodemailer = require("nodemailer");
@@ -13,8 +17,24 @@ const isInsideGeofence = require("./utils/isInsideGeofence");
 const { sendSMS } = require("./utils/sms");
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
+
+// const server = http.createServer(app);
+// const io = new Server(server, {
+//   cors: {
+//     origin: "*",
+//     methods: ["GET", "POST"],
+//   },
+// });
+
+const server = https.createServer(
+  {
+    key: fs.readFileSync("/etc/letsencrypt/live/api.pet-tracker.codehub.site/privkey.pem"),
+    cert: fs.readFileSync("/etc/letsencrypt/live/api.pet-tracker.codehub.site/fullchain.pem"),
+  },
+  app
+);
+
+const io = require("socket.io")(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
