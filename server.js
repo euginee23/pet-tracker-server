@@ -36,13 +36,20 @@ const server = https.createServer(
 
 const io = require("socket.io")(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
+    origin: ['https://pet-tracker.codehub.site', 'http://localhost:3000', 'http://localhost:5173'],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true
   },
 });
 
 // MIDDLEWARE
-app.use(cors());
+app.use(cors({
+  origin: ['https://pet-tracker.codehub.site', 'http://localhost:3000', 'http://localhost:5173'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
 app.use(express.json({ limit: "10mb" }));
 
 // MYSQL CONNECTION POOL
