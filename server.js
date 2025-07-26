@@ -17,19 +17,13 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ["https://pet-tracker.codehub.site", "http://localhost:5173", "http://localhost:3000"],
+    origin: "*",
     methods: ["GET", "POST"],
-    credentials: true
   },
-  transports: ['websocket', 'polling'],
-  allowEIO3: true
 });
 
 // MIDDLEWARE
-app.use(cors({
-  origin: ["https://pet-tracker.codehub.site", "http://localhost:5173", "http://localhost:3000"],
-  credentials: true
-}));
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 // MYSQL CONNECTION POOL
@@ -40,7 +34,7 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME,
   port: process.env.DB_PORT,
   waitForConnections: true,
-  connectionLimit: 20,
+  connectionLimit: 5,
   queueLimit: 0,
 });
 
@@ -50,6 +44,8 @@ const pool = mysql.createPool({
     const connection = await pool.getConnection();
     console.log("✅ Successfully connected to the database.");
     connection.release();
+    
+    // Initialize the notification helper with our pool
     notificationHelper.initialize(pool);
   } catch (err) {
     console.error("❌ Error connecting to the database:", err.message || err);
@@ -119,33 +115,33 @@ app.post("/data", async (req, res) => {
     if (deviceStatus[data.deviceId] !== "online") {
       console.log(`🟢 ${data.deviceId} is now ONLINE`);
       deviceStatus[data.deviceId] = "online";
-
-      // FIND USERS WHO OWNS THE TRACKER
+      
+      // Find all users who own this device
       try {
         connection = await pool.getConnection();
         const [trackers] = await connection.query(
-          `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
+          `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
           [data.deviceId]
         );
         connection.release();
-
-        // CREATE NOTIF
+        
+        // Create notifications for each user
         for (const tracker of trackers) {
           const petName = tracker.pet_name || "Your pet";
           const message = `${petName}'s tracker (${data.deviceId}) is now ONLINE`;
-
+          
           await notificationHelper.createNotification(
             io,
-            tracker.user_id,
-            data.deviceId,
+            tracker.user_id, 
+            data.deviceId, 
             message,
-            "normal"
+            'normal'
           );
         }
       } catch (notifError) {
         console.error(`❌ Error creating online notification:`, notifError);
       }
-
+      
       // SMS NOTIFICATION COMMENTED OUT DUE TO SEMAPHORE API ISSUES
       /*
       try {
@@ -201,61 +197,50 @@ app.post("/data", async (req, res) => {
         geofenceDistances.push({
           geofenceId: geofence.geofence_id,
           geofenceName: geofence.geofence_name || geofence.geofence_id,
-          distance: result.distance,
+          distance: result.distance
         });
       }
 
-      // GET PET NAME
+      // Get pet name for notifications
       const [trackerInfo] = await connection.query(
         `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
         [data.deviceId]
       );
-
+        
       for (const geofence of geofences) {
         const geofenceId = geofence.geofence_id;
         const geofenceName = geofence.geofence_name || geofenceId;
         const wasInside = lastState.includes(geofenceId);
         const isNowInside = insideGeofences.includes(geofenceId);
-        const distObj = geofenceDistances.find(
-          (gd) => gd.geofenceId === geofenceId
-        );
-
+        const distObj = geofenceDistances.find(gd => gd.geofenceId === geofenceId);
+        
+        // For each tracker associated with this device
         for (const tracker of trackerInfo) {
           const petName = tracker.pet_name || "Your pet";
-
+          
           if (!wasInside && isNowInside) {
-            console.log(
-              `✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`
-            );
-
-            // ENTERED GEOFENCE
+            console.log(`✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`);
+            
+            // Create "entered geofence" notification
             await notificationHelper.createNotification(
               io,
               tracker.user_id,
               data.deviceId,
               `${petName} has entered the "${geofenceName}" geofence zone`,
-              "normal"
+              'normal'
             );
           } else if (wasInside && isNowInside) {
-            console.log(
-              `✅ Pet ${data.deviceId} is inside geofence (${geofenceName})`
-            );
+            console.log(`✅ Pet ${data.deviceId} is inside geofence (${geofenceName})`);
           } else if (wasInside && !isNowInside) {
-            console.warn(
-              `⚠️ Pet ${
-                data.deviceId
-              } is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(
-                2
-              )}m away)`
-            );
-
-            // LEFT GEOFENCE
+            console.warn(`⚠️ Pet ${data.deviceId} is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(2)}m away)`);
+            
+            // Create "left geofence" notification
             await notificationHelper.createNotification(
               io,
               tracker.user_id,
               data.deviceId,
               `⚠️ ${petName} has left the "${geofenceName}" geofence zone!`,
-              "alert"
+              'alert' 
             );
           }
         }
@@ -263,11 +248,9 @@ app.post("/data", async (req, res) => {
 
       if (insideGeofences.length === 0) {
         const distMsg = geofenceDistances
-          .map((gd) => `${gd.geofenceName} ~${gd.distance.toFixed(2)}m`)
+          .map(gd => `${gd.geofenceName} ~${gd.distance.toFixed(2)}m`)
           .join(", ");
-        console.warn(
-          `⚠️ Pet ${data.deviceId} is now outside all geofences: ${distMsg}`
-        );
+        console.warn(`⚠️ Pet ${data.deviceId} is now outside all geofences: ${distMsg}`);
       }
 
       global.lastGeofenceState[data.deviceId] = insideGeofences;
@@ -298,7 +281,8 @@ setInterval(() => {
         let connection;
         try {
           connection = await pool.getConnection();
-
+          
+          // Update the tracker's last known data
           await connection.query(
             `UPDATE trackers 
          SET last_battery = ?, last_lat = ?, last_lng = ? 
@@ -306,22 +290,24 @@ setInterval(() => {
             [info.battery ?? null, info.lat ?? null, info.lng ?? null, deviceId]
           );
           console.log(`📦 Saved last known data for ${deviceId}`);
-
+          
+          // Get all users who have this tracker
           const [trackers] = await connection.query(
-            `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
+            `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
             [deviceId]
           );
-
+          
+          // Create notifications for each user
           for (const tracker of trackers) {
             const petName = tracker.pet_name || "Your pet";
             const message = `${petName}'s tracker (${deviceId}) has gone OFFLINE`;
-
+            
             await notificationHelper.createNotification(
               io,
-              tracker.user_id,
-              deviceId,
+              tracker.user_id, 
+              deviceId, 
               message,
-              "offline"
+              'offline' // Use the offline sound
             );
           }
         } catch (err) {
@@ -1084,22 +1070,22 @@ app.get("/api/notifications", async (req, res) => {
   let connection;
   try {
     const userId = req.query.userId;
-
+    
     connection = await pool.getConnection();
-
+    
     let query = `SELECT notification_id as id, user_id, device_id, message, created_at, is_read 
                 FROM notifications`;
-
+    
     const params = [];
     if (userId) {
       query += ` WHERE user_id = ?`;
       params.push(userId);
     }
-
+    
     query += ` ORDER BY created_at DESC LIMIT 50`;
-
+    
     const [notifications] = await connection.query(query, params);
-
+    
     return res.status(200).json(notifications);
   } catch (err) {
     console.error("❌ Error fetching notifications:", err.message);
@@ -1114,20 +1100,18 @@ app.put("/api/notifications/:notificationId/read", async (req, res) => {
   let connection;
   try {
     const { notificationId } = req.params;
-
+    
     connection = await pool.getConnection();
-
+    
     await connection.query(
       `UPDATE notifications SET is_read = 1 WHERE notification_id = ?`,
       [notificationId]
     );
-
+    
     return res.status(200).json({ message: "Notification marked as read" });
   } catch (err) {
     console.error("❌ Error marking notification as read:", err.message);
-    return res
-      .status(500)
-      .json({ message: "Failed to mark notification as read" });
+    return res.status(500).json({ message: "Failed to mark notification as read" });
   } finally {
     if (connection) connection.release();
   }
@@ -1138,27 +1122,23 @@ app.put("/api/notifications/mark-all-read", async (req, res) => {
   let connection;
   try {
     const userId = req.query.userId;
-
+    
     connection = await pool.getConnection();
-
+    
     let query = `UPDATE notifications SET is_read = 1`;
     const params = [];
-
+    
     if (userId) {
       query += ` WHERE user_id = ?`;
       params.push(userId);
     }
-
+    
     await connection.query(query, params);
-
-    return res
-      .status(200)
-      .json({ message: "All notifications marked as read" });
+    
+    return res.status(200).json({ message: "All notifications marked as read" });
   } catch (err) {
     console.error("❌ Error marking all notifications as read:", err.message);
-    return res
-      .status(500)
-      .json({ message: "Failed to mark all notifications as read" });
+    return res.status(500).json({ message: "Failed to mark all notifications as read" });
   } finally {
     if (connection) connection.release();
   }
@@ -1169,19 +1149,19 @@ app.delete("/api/notifications/clear-all", async (req, res) => {
   let connection;
   try {
     const userId = req.query.userId;
-
+    
     connection = await pool.getConnection();
-
+    
     let query = `DELETE FROM notifications`;
     const params = [];
-
+    
     if (userId) {
       query += ` WHERE user_id = ?`;
       params.push(userId);
     }
-
+    
     await connection.query(query, params);
-
+    
     return res.status(200).json({ message: "All notifications cleared" });
   } catch (err) {
     console.error("❌ Error clearing notifications:", err.message);

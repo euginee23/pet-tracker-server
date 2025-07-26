@@ -4,21 +4,6 @@ require("dotenv").config();
 // Get the MySQL connection pool from server.js or create a new one
 let pool;
 
-// Create a default pool if needed
-const createDefaultPool = () => {
-  console.warn('⚠️ Creating default notification database pool as fallback');
-  return mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    port: process.env.DB_PORT,
-    waitForConnections: true,
-    connectionLimit: 2,
-    queueLimit: 0,
-  });
-};
-
 /**
  * Initialize the notifications helper with a MySQL connection pool
  * @param {Object} connectionPool - MySQL connection pool from server.js
@@ -38,13 +23,8 @@ function initialize(connectionPool) {
  */
 async function createNotification(io, userId, deviceId, message, soundType = 'normal') {
   if (!pool) {
-    console.warn('⚠️ Notification helper not initialized with a database pool, using default');
-    try {
-      pool = createDefaultPool();
-    } catch (err) {
-      console.error('❌ Failed to create default database pool:', err);
-      return null;
-    }
+    console.error('❌ Notification helper not initialized with a database pool');
+    return null;
   }
 
   let connection;
@@ -86,6 +66,5 @@ async function createNotification(io, userId, deviceId, message, soundType = 'no
 
 module.exports = {
   initialize,
-  createNotification,
-  createDefaultPool
+  createNotification
 };
