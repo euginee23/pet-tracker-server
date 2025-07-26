@@ -85,7 +85,11 @@ function broadcastDevices() {
 // SOCKET CONNECTION
 io.on("connection", (socket) => {
   console.log("🔌 Client connected via Socket.IO");
-  socket.emit("devices", getAllDevicesWithStatus());
+  
+  // Broadcast current devices to ALL clients (like notifications)
+  const currentDevices = getAllDevicesWithStatus();
+  io.emit("devices", currentDevices);
+  console.log(`📡 Broadcasted ${currentDevices.length} devices to all clients`);
 
   socket.on("disconnect", () => {
     console.log("❌ Client disconnected");
