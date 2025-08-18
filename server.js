@@ -86,7 +86,6 @@ function broadcastDevices() {
 io.on("connection", (socket) => {
   console.log("🔌 Client connected via Socket.IO");
   
-  // Broadcast current devices to ALL clients (like notifications)
   const currentDevices = getAllDevicesWithStatus();
   io.emit("devices", currentDevices);
   console.log(`📡 Broadcasted ${currentDevices.length} devices to all clients`);
@@ -120,7 +119,6 @@ app.post("/data", async (req, res) => {
       console.log(`🟢 ${data.deviceId} is now ONLINE`);
       deviceStatus[data.deviceId] = "online";
       
-      // Find all users who own this device
       try {
         connection = await pool.getConnection();
         const [trackers] = await connection.query(
@@ -129,7 +127,6 @@ app.post("/data", async (req, res) => {
         );
         connection.release();
         
-        // Create notifications for each user
         for (const tracker of trackers) {
           const petName = tracker.pet_name || "Your pet";
           const message = `${petName}'s tracker (${data.deviceId}) is now ONLINE`;
@@ -146,8 +143,7 @@ app.post("/data", async (req, res) => {
         console.error(`❌ Error creating online notification:`, notifError);
       }
       
-      // SMS NOTIFICATION COMMENTED OUT DUE TO SEMAPHORE API ISSUES
-      /*
+      // SMS NOTIFICATION FOR DEVICE ONLINE STATUS
       try {
         let phoneNumber = '09490161595';
         
@@ -157,16 +153,15 @@ app.post("/data", async (req, res) => {
         
         console.log(`📱 Attempting to send SMS notification for device ${data.deviceId} to ${phoneNumber}`);
         
-        const smsResponse = await sendSMS({
-          number: phoneNumber,
-          message: `Device ${data.deviceId} is now ONLINE. Time: ${new Date().toLocaleString()}`
-        });
+        const smsResponse = await sendSMS(
+          phoneNumber,
+          `Device ${data.deviceId} is now ONLINE. Time: ${new Date().toLocaleString()}`
+        );
         
         console.log(`✅ SMS notification sent for device ${data.deviceId}`, smsResponse);
       } catch (smsError) {
         console.error(`❌ Failed to send SMS notification:`, smsError.message);
       }
-      */
     }
 
     if (!global.lastGeofenceState) global.lastGeofenceState = {};
@@ -205,7 +200,7 @@ app.post("/data", async (req, res) => {
         });
       }
 
-      // Get pet name for notifications
+      // GET PET NAME FOR NOTIFICATIONS
       const [trackerInfo] = await connection.query(
         `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
         [data.deviceId]
@@ -218,14 +213,12 @@ app.post("/data", async (req, res) => {
         const isNowInside = insideGeofences.includes(geofenceId);
         const distObj = geofenceDistances.find(gd => gd.geofenceId === geofenceId);
         
-        // For each tracker associated with this device
         for (const tracker of trackerInfo) {
           const petName = tracker.pet_name || "Your pet";
           
           if (!wasInside && isNowInside) {
             console.log(`✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`);
             
-            // Create "entered geofence" notification
             await notificationHelper.createNotification(
               io,
               tracker.user_id,
@@ -233,12 +226,32 @@ app.post("/data", async (req, res) => {
               `${petName} has entered the "${geofenceName}" geofence zone`,
               'normal'
             );
+            
+            // SMS NOTIFICATION FOR GEOFENCE ENTRY
+            try {
+              let phoneNumber = '09490161595';
+              
+              if (phoneNumber.startsWith('0')) {
+                phoneNumber = '63' + phoneNumber.substring(1);
+              }
+              
+              console.log(`📱 Attempting to send SMS for geofence entry: ${petName} entered ${geofenceName}`);
+              
+              const smsResponse = await sendSMS(
+                phoneNumber,
+                `${petName} has ENTERED the "${geofenceName}" geofence zone. Time: ${new Date().toLocaleString()}`
+              );
+              
+              console.log(`✅ SMS sent for geofence entry`, smsResponse);
+            } catch (smsError) {
+              console.error(`❌ Failed to send SMS for geofence entry:`, smsError.message);
+            }
           } else if (wasInside && isNowInside) {
             console.log(`✅ Pet ${data.deviceId} is inside geofence (${geofenceName})`);
           } else if (wasInside && !isNowInside) {
             console.warn(`⚠️ Pet ${data.deviceId} is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(2)}m away)`);
             
-            // Create "left geofence" notification
+            // "left geofence" notification
             await notificationHelper.createNotification(
               io,
               tracker.user_id,
@@ -246,6 +259,26 @@ app.post("/data", async (req, res) => {
               `⚠️ ${petName} has left the "${geofenceName}" geofence zone!`,
               'alert' 
             );
+            
+            // SMS NOTIFICATION FOR GEOFENCE EXIT
+            try {
+              let phoneNumber = '09490161595';
+              
+              if (phoneNumber.startsWith('0')) {
+                phoneNumber = '63' + phoneNumber.substring(1);
+              }
+              
+              console.log(`📱 Attempting to send SMS for geofence exit: ${petName} left ${geofenceName}`);
+              
+              const smsResponse = await sendSMS(
+                phoneNumber,
+                `⚠️ ALERT: ${petName} has LEFT the "${geofenceName}" geofence zone! Time: ${new Date().toLocaleString()}`
+              );
+              
+              console.log(`✅ SMS sent for geofence exit`, smsResponse);
+            } catch (smsError) {
+              console.error(`❌ Failed to send SMS for geofence exit:`, smsError.message);
+            }
           }
         }
       }
@@ -286,7 +319,7 @@ setInterval(() => {
         try {
           connection = await pool.getConnection();
           
-          // Update the tracker's last known data
+          // TRACKER LAST KNOWN DATA
           await connection.query(
             `UPDATE trackers 
          SET last_battery = ?, last_lat = ?, last_lng = ? 
@@ -295,13 +328,13 @@ setInterval(() => {
           );
           console.log(`📦 Saved last known data for ${deviceId}`);
           
-          // Get all users who have this tracker
+          // TRACKER OWNER
           const [trackers] = await connection.query(
             `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
             [deviceId]
           );
           
-          // Create notifications for each user
+          // CREATE NONTIF
           for (const tracker of trackers) {
             const petName = tracker.pet_name || "Your pet";
             const message = `${petName}'s tracker (${deviceId}) has gone OFFLINE`;
@@ -311,9 +344,30 @@ setInterval(() => {
               tracker.user_id, 
               deviceId, 
               message,
-              'offline' // Use the offline sound
+              'offline'
             );
           }
+          
+          // SMS NOTIFICATION FOR DEVICE OFFLINE STATUS
+          try {
+            let phoneNumber = '09490161595';
+            
+            if (phoneNumber.startsWith('0')) {
+              phoneNumber = '63' + phoneNumber.substring(1);
+            }
+            
+            console.log(`📱 Attempting to send SMS notification for device ${deviceId} going offline to ${phoneNumber}`);
+            
+            const smsResponse = await sendSMS(
+              phoneNumber,
+              `Device ${deviceId} has gone OFFLINE. Time: ${new Date().toLocaleString()}`
+            );
+            
+            console.log(`✅ SMS notification sent for offline device ${deviceId}`, smsResponse);
+          } catch (smsError) {
+            console.error(`❌ Failed to send SMS notification for offline device:`, smsError.message);
+          }
+
         } catch (err) {
           console.error(
             `❌ Failed to process offline device ${deviceId}:`,

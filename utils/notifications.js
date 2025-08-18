@@ -48,7 +48,7 @@ async function createNotification(io, userId, deviceId, message, soundType = 'no
       message,
       created_at: new Date().toISOString(),
       is_read: 0,
-      sound_type: soundType // Add sound type for frontend
+      sound_type: soundType 
     };
     
     // Emit to all connected clients
