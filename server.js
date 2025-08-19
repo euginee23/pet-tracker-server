@@ -12,6 +12,7 @@ require("dotenv").config();
 const isInsideGeofence = require("./utils/isInsideGeofence");
 const { sendSMS } = require("./utils/sms");
 const notificationHelper = require("./utils/notifications");
+const { getTrackerOwnerPhone, isNotificationEnabled } = require("./utils/userNotificationUtils");
 
 const app = express();
 const server = http.createServer(app);
@@ -107,6 +108,10 @@ app.post("/data", async (req, res) => {
       return res.status(400).send("Invalid JSON payload");
     }
 
+    // Track previous state to detect changes
+    const prevState = latestDevices[data.deviceId] || {};
+    
+    // Update device state
     latestDevices[data.deviceId] = {
       lat: data.lat,
       lng: data.lng,
@@ -114,6 +119,86 @@ app.post("/data", async (req, res) => {
       lastSeen: now,
       online: true,
     };
+    
+    // Check for low battery (20% or below)
+    if (data.battery !== undefined && data.battery <= 20 && 
+        (prevState.battery === undefined || prevState.battery > 20)) {
+      try {
+        // Get device information for notification
+        let batteryConnection = await pool.getConnection();
+        const [trackers] = await batteryConnection.query(
+          `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
+          [data.deviceId]
+        );
+        batteryConnection.release();
+        
+        for (const tracker of trackers) {
+          const userId = tracker.user_id;
+          const petName = tracker.pet_name || "Your pet";
+          
+          // Create in-app notification
+          await notificationHelper.createNotification(
+            io,
+            userId,
+            data.deviceId,
+            `⚠️ ${petName}'s tracker battery is low (${data.battery}%)`,
+            'alert'
+          );
+          
+          // SMS NOTIFICATION FOR LOW BATTERY
+          try {
+            console.log(`🔋 Checking low battery notification settings for user ${userId}`);
+            
+            // Get notification settings for debugging
+            let settingsConn = await pool.getConnection();
+            const [settings] = await settingsConn.query(
+              `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+              [userId]
+            );
+            settingsConn.release();
+            
+            if (settings.length > 0) {
+              console.log(`📋 Raw low battery settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+            } else {
+              console.log(`⚠️ No SMS settings found for user ${userId}`);
+              continue;
+            }
+            
+            // Check if low battery notifications are enabled
+            const notificationEnabled = await isNotificationEnabled(pool, userId, 'low_battery');
+            
+            if (!notificationEnabled) {
+              console.log(`ℹ️ User ${userId} has disabled SMS notifications for low battery events`);
+              continue;
+            } else {
+              console.log(`✅ User ${userId} has enabled SMS notifications for low battery events`);
+            }
+            
+            // Get phone number for SMS
+            const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
+            
+            if (!phoneNumber) {
+              console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+              continue;
+            }
+            
+            console.log(`📱 Sending SMS for low battery: ${petName}'s tracker at ${data.battery}% to ${phoneNumber}`);
+            
+            // Send SMS notification
+            const smsResponse = await sendSMS(
+              phoneNumber,
+              `⚠️ ALERT: ${petName}'s tracker battery is low (${data.battery}%). Please charge soon. Time: ${new Date().toLocaleString()}`
+            );
+            
+            console.log(`✅ SMS sent for low battery`, smsResponse);
+          } catch (smsError) {
+            console.error(`❌ Failed to send SMS for low battery:`, smsError.message);
+          }
+        }
+      } catch (batteryError) {
+        console.error(`❌ Error processing low battery notification:`, batteryError.message);
+      }
+    }
 
     if (deviceStatus[data.deviceId] !== "online") {
       console.log(`🟢 ${data.deviceId} is now ONLINE`);
@@ -139,28 +224,59 @@ app.post("/data", async (req, res) => {
             'normal'
           );
         }
+        
+        // SMS NOTIFICATION FOR DEVICE ONLINE STATUS
+        try {
+          for (const tracker of trackers) {
+            const userId = tracker.user_id;
+            
+            console.log(`🔎 Checking online notification settings for user ${userId} and device ${data.deviceId}`);
+            
+            let connection = await pool.getConnection();
+            const [settings] = await connection.query(
+              `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+              [userId]
+            );
+            connection.release();
+            
+            if (settings.length > 0) {
+              console.log(`📋 Raw settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+            } else {
+              console.log(`⚠️ No SMS settings found for user ${userId}`);
+              continue;
+            }
+            
+            const notificationEnabled = await isNotificationEnabled(pool, userId, 'online');
+            
+            if (!notificationEnabled) {
+              console.log(`ℹ️ User ${userId} has disabled SMS notifications for online events`);
+              continue;
+            } else {
+              console.log(`✅ User ${userId} has enabled SMS notifications for online events`);
+            }
+            
+            const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
+            
+            if (!phoneNumber) {
+              console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+              continue;
+            }
+            
+            const petName = tracker.pet_name || "Your pet";
+            console.log(`📱 Sending SMS notification for ${data.deviceId} going online to ${phoneNumber}`);
+            
+            const smsResponse = await sendSMS(
+              phoneNumber,
+              `${petName}'s tracker (${data.deviceId}) is now ONLINE. Time: ${new Date().toLocaleString()}`
+            );
+            
+            console.log(`✅ SMS notification sent for device ${data.deviceId}`, smsResponse);
+          }
+        } catch (smsError) {
+          console.error(`❌ Failed to send SMS notification:`, smsError.message);
+        }
       } catch (notifError) {
         console.error(`❌ Error creating online notification:`, notifError);
-      }
-      
-      // SMS NOTIFICATION FOR DEVICE ONLINE STATUS
-      try {
-        let phoneNumber = '09490161595';
-        
-        if (phoneNumber.startsWith('0')) {
-          phoneNumber = '63' + phoneNumber.substring(1);
-        }
-        
-        console.log(`📱 Attempting to send SMS notification for device ${data.deviceId} to ${phoneNumber}`);
-        
-        const smsResponse = await sendSMS(
-          phoneNumber,
-          `Device ${data.deviceId} is now ONLINE. Time: ${new Date().toLocaleString()}`
-        );
-        
-        console.log(`✅ SMS notification sent for device ${data.deviceId}`, smsResponse);
-      } catch (smsError) {
-        console.error(`❌ Failed to send SMS notification:`, smsError.message);
       }
     }
 
@@ -229,13 +345,41 @@ app.post("/data", async (req, res) => {
             
             // SMS NOTIFICATION FOR GEOFENCE ENTRY
             try {
-              let phoneNumber = '09490161595';
+              const userId = tracker.user_id;
+              console.log(`🔎 Checking geofence entry notification settings for user ${userId}`);
               
-              if (phoneNumber.startsWith('0')) {
-                phoneNumber = '63' + phoneNumber.substring(1);
+              // Get raw notification settings first to debug
+              let settingsConn = await pool.getConnection();
+              const [settings] = await settingsConn.query(
+                `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+                [userId]
+              );
+              settingsConn.release();
+              
+              if (settings.length > 0) {
+                console.log(`📋 Raw geofence entry settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+              } else {
+                console.log(`⚠️ No SMS settings found for user ${userId}`);
+                continue;
               }
               
-              console.log(`📱 Attempting to send SMS for geofence entry: ${petName} entered ${geofenceName}`);
+              const notificationEnabled = await isNotificationEnabled(pool, userId, 'in_geofence');
+              
+              if (!notificationEnabled) {
+                console.log(`ℹ️ User ${userId} has disabled SMS notifications for geofence entry events`);
+                continue;
+              } else {
+                console.log(`✅ User ${userId} has enabled SMS notifications for geofence entry events`);
+              }
+              
+              const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
+              
+              if (!phoneNumber) {
+                console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+                continue;
+              }
+              
+              console.log(`📱 Sending SMS for geofence entry: ${petName} entered ${geofenceName} to ${phoneNumber}`);
               
               const smsResponse = await sendSMS(
                 phoneNumber,
@@ -251,7 +395,7 @@ app.post("/data", async (req, res) => {
           } else if (wasInside && !isNowInside) {
             console.warn(`⚠️ Pet ${data.deviceId} is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(2)}m away)`);
             
-            // "left geofence" notification
+            // "LEFT GEOFENCE" NOTIFICATION
             await notificationHelper.createNotification(
               io,
               tracker.user_id,
@@ -262,13 +406,41 @@ app.post("/data", async (req, res) => {
             
             // SMS NOTIFICATION FOR GEOFENCE EXIT
             try {
-              let phoneNumber = '09490161595';
+              const userId = tracker.user_id;
+              console.log(`🔎 Checking geofence exit notification settings for user ${userId}`);
               
-              if (phoneNumber.startsWith('0')) {
-                phoneNumber = '63' + phoneNumber.substring(1);
+              // Get raw notification settings first to debug
+              let settingsConn = await pool.getConnection();
+              const [settings] = await settingsConn.query(
+                `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+                [userId]
+              );
+              settingsConn.release();
+              
+              if (settings.length > 0) {
+                console.log(`📋 Raw geofence exit settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+              } else {
+                console.log(`⚠️ No SMS settings found for user ${userId}`);
+                continue;
               }
               
-              console.log(`📱 Attempting to send SMS for geofence exit: ${petName} left ${geofenceName}`);
+              const notificationEnabled = await isNotificationEnabled(pool, userId, 'out_geofence');
+              
+              if (!notificationEnabled) {
+                console.log(`ℹ️ User ${userId} has disabled SMS notifications for geofence exit events`);
+                continue;
+              } else {
+                console.log(`✅ User ${userId} has enabled SMS notifications for geofence exit events`);
+              }
+              
+              const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
+              
+              if (!phoneNumber) {
+                console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+                continue;
+              }
+              
+              console.log(`📱 Sending SMS for geofence exit: ${petName} left ${geofenceName} to ${phoneNumber}`);
               
               const smsResponse = await sendSMS(
                 phoneNumber,
@@ -322,11 +494,11 @@ setInterval(() => {
           // TRACKER LAST KNOWN DATA
           await connection.query(
             `UPDATE trackers 
-         SET last_battery = ?, last_lat = ?, last_lng = ? 
+         SET last_battery = ?, last_lat = ?, last_lng = ?, last_seen = NOW()
          WHERE device_id = ?`,
             [info.battery ?? null, info.lat ?? null, info.lng ?? null, deviceId]
           );
-          console.log(`📦 Saved last known data for ${deviceId}`);
+          console.log(`📦 Saved last known data for ${deviceId} (Battery: ${info.battery}%)`);
           
           // TRACKER OWNER
           const [trackers] = await connection.query(
@@ -350,20 +522,52 @@ setInterval(() => {
           
           // SMS NOTIFICATION FOR DEVICE OFFLINE STATUS
           try {
-            let phoneNumber = '09490161595';
-            
-            if (phoneNumber.startsWith('0')) {
-              phoneNumber = '63' + phoneNumber.substring(1);
+            for (const tracker of trackers) {
+              const userId = tracker.user_id;
+              
+              console.log(`🔎 Checking offline notification settings for user ${userId} and device ${deviceId}`);
+              
+              // Get raw notification settings first to debug
+              let settingsConn = await pool.getConnection();
+              const [settings] = await settingsConn.query(
+                `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+                [userId]
+              );
+              settingsConn.release();
+              
+              if (settings.length > 0) {
+                console.log(`📋 Raw settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+              } else {
+                console.log(`⚠️ No SMS settings found for user ${userId}`);
+                continue;
+              }
+              
+              const notificationEnabled = await isNotificationEnabled(pool, userId, 'offline');
+              
+              if (!notificationEnabled) {
+                console.log(`ℹ️ User ${userId} has disabled SMS notifications for offline events`);
+                continue;
+              } else {
+                console.log(`✅ User ${userId} has enabled SMS notifications for offline events`);
+              }
+              
+              const { phoneNumber } = await getTrackerOwnerPhone(pool, deviceId);
+              
+              if (!phoneNumber) {
+                console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+                continue;
+              }
+              
+              const petName = tracker.pet_name || "Your pet";
+              console.log(`📱 Sending SMS notification for ${deviceId} going offline to ${phoneNumber}`);
+              
+              const smsResponse = await sendSMS(
+                phoneNumber,
+                `${petName}'s tracker (${deviceId}) has gone OFFLINE. Time: ${new Date().toLocaleString()}`
+              );
+              
+              console.log(`✅ SMS notification sent for offline device ${deviceId}`, smsResponse);
             }
-            
-            console.log(`📱 Attempting to send SMS notification for device ${deviceId} going offline to ${phoneNumber}`);
-            
-            const smsResponse = await sendSMS(
-              phoneNumber,
-              `Device ${deviceId} has gone OFFLINE. Time: ${new Date().toLocaleString()}`
-            );
-            
-            console.log(`✅ SMS notification sent for offline device ${deviceId}`, smsResponse);
           } catch (smsError) {
             console.error(`❌ Failed to send SMS notification for offline device:`, smsError.message);
           }
@@ -1224,6 +1428,118 @@ app.delete("/api/notifications/clear-all", async (req, res) => {
   } catch (err) {
     console.error("❌ Error clearing notifications:", err.message);
     return res.status(500).json({ message: "Failed to clear notifications" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// CREATE SMS NOTIFICATION SETTINGS FOR A USER
+app.post("/api/sms-notification-settings/:userId", async (req, res) => {
+  let connection;
+  try {
+    const { userId } = req.params;
+    const {
+      enable_sms_notification,
+      online,
+      offline,
+      out_geofence,
+      in_geofence,
+      low_battery,
+    } = req.body;
+
+    connection = await pool.getConnection();
+
+    const [existing] = await connection.query(
+      `SELECT sms_setting_id FROM sms_notification_settings WHERE user_id = ?`,
+      [userId]
+    );
+
+    if (existing.length > 0) {
+      return res.status(409).json({ message: "SMS notification settings already exist for this user" });
+    }
+
+    await connection.query(
+      `INSERT INTO sms_notification_settings (user_id, enable_sms_notification, online, offline, out_geofence, in_geofence, low_battery)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        userId,
+        enable_sms_notification,
+        online,
+        offline,
+        out_geofence,
+        in_geofence,
+        low_battery,
+      ]
+    );
+
+    res.status(201).json({ message: "SMS notification settings created successfully" });
+  } catch (err) {
+    console.error("❌ Error creating SMS notification settings:", err.message);
+    res.status(500).json({ message: "Failed to create SMS notification settings" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// GET SMS NOTIFICATION SETTINGS FOR A USER
+app.get("/api/sms-notification-settings/:userId", async (req, res) => {
+  let connection;
+  try {
+    const { userId } = req.params;
+
+    connection = await pool.getConnection();
+
+    const [rows] = await connection.query(
+      `SELECT sms_setting_id, enable_sms_notification, online, offline, out_geofence, in_geofence, low_battery
+       FROM sms_notification_settings
+       WHERE user_id = ?`,
+      [userId]
+    );
+
+    res.status(200).json(rows);
+  } catch (err) {
+    console.error("❌ Error fetching SMS notification settings:", err.message);
+    res.status(500).json({ message: "Failed to fetch SMS notification settings" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// UPDATE SMS NOTIFICATION SETTINGS FOR A USER
+app.put("/api/sms-notification-settings/:userId", async (req, res) => {
+  let connection;
+  try {
+    const { userId } = req.params;
+    const {
+      enable_sms_notification,
+      online,
+      offline,
+      out_geofence,
+      in_geofence,
+      low_battery,
+    } = req.body;
+
+    connection = await pool.getConnection();
+
+    await connection.query(
+      `UPDATE sms_notification_settings
+       SET enable_sms_notification = ?, online = ?, offline = ?, out_geofence = ?, in_geofence = ?, low_battery = ?
+       WHERE user_id = ?`,
+      [
+        enable_sms_notification,
+        online,
+        offline,
+        out_geofence,
+        in_geofence,
+        low_battery,
+        userId,
+      ]
+    );
+
+    res.status(200).json({ message: "SMS notification settings updated successfully" });
+  } catch (err) {
+    console.error("❌ Error updating SMS notification settings:", err.message);
+    res.status(500).json({ message: "Failed to update SMS notification settings" });
   } finally {
     if (connection) connection.release();
   }
