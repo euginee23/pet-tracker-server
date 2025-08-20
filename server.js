@@ -108,10 +108,8 @@ app.post("/data", async (req, res) => {
       return res.status(400).send("Invalid JSON payload");
     }
 
-    // Track previous state to detect changes
     const prevState = latestDevices[data.deviceId] || {};
     
-    // Update device state
     latestDevices[data.deviceId] = {
       lat: data.lat,
       lng: data.lng,
@@ -120,11 +118,9 @@ app.post("/data", async (req, res) => {
       online: true,
     };
     
-    // Check for low battery (20% or below)
     if (data.battery !== undefined && data.battery <= 20 && 
         (prevState.battery === undefined || prevState.battery > 20)) {
       try {
-        // Get device information for notification
         let batteryConnection = await pool.getConnection();
         const [trackers] = await batteryConnection.query(
           `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
@@ -136,7 +132,6 @@ app.post("/data", async (req, res) => {
           const userId = tracker.user_id;
           const petName = tracker.pet_name || "Your pet";
           
-          // Create in-app notification
           await notificationHelper.createNotification(
             io,
             userId,
@@ -149,7 +144,6 @@ app.post("/data", async (req, res) => {
           try {
             console.log(`🔋 Checking low battery notification settings for user ${userId}`);
             
-            // Get notification settings for debugging
             let settingsConn = await pool.getConnection();
             const [settings] = await settingsConn.query(
               `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
@@ -164,7 +158,6 @@ app.post("/data", async (req, res) => {
               continue;
             }
             
-            // Check if low battery notifications are enabled
             const notificationEnabled = await isNotificationEnabled(pool, userId, 'low_battery');
             
             if (!notificationEnabled) {
@@ -174,7 +167,6 @@ app.post("/data", async (req, res) => {
               console.log(`✅ User ${userId} has enabled SMS notifications for low battery events`);
             }
             
-            // Get phone number for SMS
             const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
             
             if (!phoneNumber) {
@@ -184,7 +176,6 @@ app.post("/data", async (req, res) => {
             
             console.log(`📱 Sending SMS for low battery: ${petName}'s tracker at ${data.battery}% to ${phoneNumber}`);
             
-            // Send SMS notification
             const smsResponse = await sendSMS(
               phoneNumber,
               `⚠️ ALERT: ${petName}'s tracker battery is low (${data.battery}%). Please charge soon. Time: ${new Date().toLocaleString()}`
@@ -735,6 +726,136 @@ app.get("/api/trackers/:userId", async (req, res) => {
   }
 });
 
+// UPDATE TRACKER
+app.put("/api/update-tracker", async (req, res) => {
+  let connection;
+  try {
+    const { deviceId, userId, petName, petType, petBreed, petImage } = req.body;
+
+    if (!deviceId || !userId || !petName) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    let imageBuffer = null;
+    if (petImage && typeof petImage === "string") {
+      const base64Data = petImage.includes("base64,")
+        ? petImage.split("base64,")[1]
+        : petImage;
+      
+      imageBuffer = Buffer.from(base64Data, "base64");
+    }
+
+    connection = await pool.getConnection();
+
+    const [existingTracker] = await connection.query(
+      "SELECT device_id FROM trackers WHERE device_id = ? AND user_id = ?",
+      [deviceId, userId]
+    );
+
+    if (existingTracker.length === 0) {
+      return res.status(404).json({ message: "Tracker not found" });
+    }
+
+    let query = `UPDATE trackers SET 
+                  pet_name = ?, 
+                  pet_type = ?, 
+                  pet_breed = ?`;
+    
+    let params = [petName, petType, petBreed];
+    
+    if (imageBuffer !== null) {
+      query += `, pet_image = ?`;
+      params.push(imageBuffer);
+    }
+    
+    query += ` WHERE device_id = ? AND user_id = ?`;
+    params.push(deviceId, userId);
+
+    const [result] = await connection.query(query, params);
+    
+    if (result.affectedRows > 0) {
+      console.log(`✅ Updated tracker ${deviceId} for user ${userId}`);
+      return res.status(200).json({ 
+        message: "Tracker updated successfully",
+        success: true 
+      });
+    } else {
+      console.log(`⚠️ No changes made to tracker ${deviceId}`);
+      return res.status(200).json({ 
+        message: "No changes were made to the tracker",
+        success: true
+      });
+    }
+  } catch (err) {
+    console.error("❌ Error updating tracker:", err.message);
+    return res.status(500).json({ message: "Failed to update tracker" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// DELETE TRACKER
+app.delete("/api/trackers/:deviceId", async (req, res) => {
+  let connection;
+  try {
+    const { deviceId } = req.params;
+    const userId = req.body?.userId || req.query?.userId;
+    
+    console.log("DELETE tracker request:", { deviceId, userId, 
+      bodyUserId: req.body?.userId, 
+      queryUserId: req.query?.userId 
+    });
+
+    if (!deviceId || !userId) {
+      return res.status(400).json({ message: "Device ID and User ID are required" });
+    }
+
+    connection = await pool.getConnection();
+
+    const [trackerExists] = await connection.query(
+      "SELECT device_id FROM trackers WHERE device_id = ? AND user_id = ?",
+      [deviceId, userId]
+    );
+
+    if (trackerExists.length === 0) {
+      return res.status(404).json({ message: "Tracker not found or doesn't belong to this user" });
+    }
+
+    await connection.query(
+      "DELETE FROM geofence_assignment WHERE device_id = ? AND user_id = ?",
+      [deviceId, userId]
+    );
+
+    const [deleteResult] = await connection.query(
+      "DELETE FROM trackers WHERE device_id = ? AND user_id = ?", 
+      [deviceId, userId]
+    );
+
+    if (deleteResult.affectedRows > 0) {
+      console.log(`✅ Deleted tracker ${deviceId} for user ${userId}`);
+      return res.status(200).json({ 
+        message: "Tracker deleted successfully",
+        success: true 
+      });
+    } else {
+      console.log(`⚠️ No tracker found to delete with ID ${deviceId}`);
+      return res.status(404).json({ 
+        message: "No tracker found to delete",
+        success: false
+      });
+    }
+  } catch (err) {
+    console.error("❌ Error deleting tracker:", err);
+    console.error("Error stack:", err.stack);
+    return res.status(500).json({ 
+      message: "Failed to delete tracker",
+      error: err.message
+    });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 // SAVE GEOFENCE
 app.post("/api/geofences", async (req, res) => {
   let connection;
@@ -1095,6 +1216,8 @@ app.post("/api/send-verification-code", async (req, res) => {
       "INSERT INTO verification_codes (user_id, email, code, created_at) VALUES (?, ?, ?, NOW())",
       [userId, email, code]
     );
+    
+    console.log(`📧 Verification code sent for ${email}`);
 
     await transporter.sendMail({
       from: `"Pet Tracker" <${process.env.EMAIL_USER}>`,
@@ -1110,7 +1233,7 @@ app.post("/api/send-verification-code", async (req, res) => {
                 ${code}
               </span>
             </div>
-            <p style="font-size: 13px; color: #666; text-align: center;">This code is valid for 10 minutes.</p>
+            <p style="font-size: 13px; color: #666; text-align: center;">This code is valid until you request a new one.</p>
             <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;" />
             <p style="font-size: 12px; color: #999; text-align: center;">If you didn't request this, you can ignore this email.</p>
           </div>
@@ -1156,12 +1279,7 @@ app.post("/api/verify-code", async (req, res) => {
       return res.status(400).json({ message: "Invalid code" });
     }
 
-    const { user_id, created_at } = rows[0];
-    const expiryTime = new Date(created_at).getTime() + 10 * 60 * 1000;
-
-    if (Date.now() > expiryTime) {
-      return res.status(400).json({ message: "Verification code expired" });
-    }
+    const { user_id } = rows[0];
 
     await connection.query(
       "UPDATE users SET email_verification = 1 WHERE user_id = ? AND email = ?",
