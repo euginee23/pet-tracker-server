@@ -11,6 +11,7 @@ require("dotenv").config();
 
 const isInsideGeofence = require("./utils/isInsideGeofence");
 const { sendSMS } = require("./utils/sms");
+const { sendOTPSMS, generateOTPCode, validateOTPCode } = require("./utils/otp_sms");
 const notificationHelper = require("./utils/notifications");
 const { getTrackerOwnerPhone, isNotificationEnabled } = require("./utils/userNotificationUtils");
 const detectNearbyPets = require("./utils/detectNearbyPets");
@@ -1518,6 +1519,197 @@ app.post("/api/verify-code", async (req, res) => {
   }
 });
 
+// SEND SMS VERIFICATION CODE
+app.post("/api/send-sms-verification-code", async (req, res) => {
+  let connection;
+  try {
+    console.log("📞 SMS verification request received:", {
+      body: req.body,
+      headers: req.headers['content-type'],
+      url: req.url,
+      method: req.method
+    });
+    
+    const { phone, userId } = req.body;
+
+    if (!phone || !userId) {
+      console.log("❌ Missing required fields:", { phone: !!phone, userId: !!userId });
+      return res.status(400).json({ 
+        message: "Phone number and user ID are required" 
+      });
+    }
+
+    connection = await pool.getConnection();
+
+    const [users] = await connection.query(
+      "SELECT user_id FROM users WHERE user_id = ?",
+      [userId]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const customCode = generateOTPCode(6);
+    console.log(`🔢 Generated OTP code: ${customCode} for user ${userId}`);
+
+    let formattedPhone = phone;
+    if (formattedPhone.startsWith('63')) {
+      formattedPhone = phone;
+    } else if (formattedPhone.startsWith('09')) {
+      formattedPhone = '63' + phone.substring(1);
+    } else if (formattedPhone.startsWith('9')) {
+      formattedPhone = '63' + phone;
+    }
+    
+    console.log(`📱 Formatted phone: ${phone} -> ${formattedPhone}`);
+
+    await connection.query(
+      "DELETE FROM sms_verification_codes WHERE user_id = ?",
+      [userId]
+    );
+
+    await connection.query(
+      "INSERT INTO sms_verification_codes (user_id, phone, code, created_at) VALUES (?, ?, ?, NOW())",
+      [userId, formattedPhone, customCode]
+    );
+
+    const message = "Your Pet Tracker verification code is: {otp}.";
+    console.log(`📱 Sending SMS to ${formattedPhone} with message: "${message}" and customCode: ${customCode}`);
+    const result = await sendOTPSMS(formattedPhone, message, customCode);
+
+    if (result.success) {
+      console.log(`📱 SMS verification code sent to ${formattedPhone} for user ${userId}`);
+      return res.status(200).json({
+        message: "SMS verification code sent successfully",
+        otpCode: customCode,
+        messageId: result.messageId
+      });
+    } else {
+
+      await connection.query(
+        "DELETE FROM sms_verification_codes WHERE user_id = ? AND code = ?",
+        [userId, customCode]
+      );
+      
+      return res.status(500).json({
+        message: "Failed to send SMS verification code",
+        error: result.error
+      });
+    }
+  } catch (err) {
+    console.error("❌ Error sending SMS verification code:", err.message);
+    return res.status(500).json({ 
+      message: "Server error while sending SMS verification code" 
+    });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// VERIFY SMS CODE
+app.post("/api/verify-sms-code", async (req, res) => {
+  let connection;
+  try {
+    const { userId, phone, code } = req.body;
+
+    if (!userId || !phone || !code) {
+      return res.status(400).json({ 
+        message: "User ID, phone number, and code are required" 
+      });
+    }
+
+    if (!validateOTPCode(code, 6)) {
+      return res.status(400).json({ 
+        message: "Invalid code format. Code must be 6 digits." 
+      });
+    }
+
+    connection = await pool.getConnection();
+
+    // The phone parameter here could be in various formats:
+    // - Original user format (e.g., 09XXXXXXXXX)
+    // - Already formatted (e.g., 639XXXXXXXXX)
+    // We need to match what was stored in the database during SMS sending
+    
+    console.log(`🔍 SMS Verification Debug:`, {
+      originalPhone: phone,
+      userId: userId,
+      code: code
+    });
+
+    // First, try to find with the original phone format
+    let [rows] = await connection.query(
+      "SELECT sms_verification_id, created_at FROM sms_verification_codes WHERE user_id = ? AND phone = ? AND code = ?",
+      [userId, phone, code]
+    );
+
+    // If not found, try with formatted phone (639XXXXXXXXX format)
+    if (rows.length === 0) {
+      let formattedPhone = phone;
+      if (!formattedPhone.startsWith('63')) {
+        if (formattedPhone.startsWith('09')) {
+          formattedPhone = '63' + phone.substring(1);
+        } else if (formattedPhone.startsWith('9')) {
+          formattedPhone = '63' + phone;
+        } else {
+          formattedPhone = '63' + phone;
+        }
+      }
+      
+      [rows] = await connection.query(
+        "SELECT sms_verification_id, created_at FROM sms_verification_codes WHERE user_id = ? AND phone = ? AND code = ?",
+        [userId, formattedPhone, code]
+      );
+      
+      console.log(`🔍 Tried formatted phone:`, {
+        formattedPhone: formattedPhone,
+        rowsFound: rows.length
+      });
+    }
+
+    console.log(`🔍 Database query result:`, {
+      rowsFound: rows.length,
+      searchCriteria: { userId, phone, code }
+    });
+
+    // Also check what's actually in the database for this user
+    const [allCodes] = await connection.query(
+      "SELECT phone, code FROM sms_verification_codes WHERE user_id = ?",
+      [userId]
+    );
+    console.log(`🔍 All codes for user ${userId}:`, allCodes);
+
+    if (rows.length === 0) {
+      return res.status(400).json({ 
+        message: "Invalid or expired verification code" 
+      });
+    }
+
+    await connection.query(
+      "UPDATE users SET phone_verification = 1, phone = ? WHERE user_id = ?",
+      [phone, userId]
+    );
+
+    await connection.query(
+      "DELETE FROM sms_verification_codes WHERE user_id = ?",
+      [userId]
+    );
+
+    console.log(`✅ SMS verified for user ${userId} with phone ${phone}`);
+    return res.status(200).json({ 
+      message: "Phone number verified successfully" 
+    });
+  } catch (err) {
+    console.error("❌ Error verifying SMS code:", err.message);
+    return res.status(500).json({ 
+      message: "Server error while verifying SMS code" 
+    });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 // UPDATE PASSWORD
 app.post("/api/update-password", async (req, res) => {
   let connection;
@@ -1646,7 +1838,6 @@ app.post("/api/user-profile", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Convert profile_photo BLOB to base64 if it exists
     const user = rows[0];
     if (user.profile_photo) {
       user.profile_photo = user.profile_photo.toString('base64');
