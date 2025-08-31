@@ -51,8 +51,8 @@ async function createNotification(io, userId, deviceId, message, soundType = 'no
       sound_type: soundType 
     };
     
-    // Emit to all connected clients
-    io.emit('notification', notification);
+    // Emit only to the specific user's room
+    io.to(userId.toString()).emit('notification', notification);
     
     console.log(`📢 Notification created and emitted: ${message}`);
     return notification;

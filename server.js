@@ -13,6 +13,7 @@ const isInsideGeofence = require("./utils/isInsideGeofence");
 const { sendSMS } = require("./utils/sms");
 const notificationHelper = require("./utils/notifications");
 const { getTrackerOwnerPhone, isNotificationEnabled } = require("./utils/userNotificationUtils");
+const detectNearbyPets = require("./utils/detectNearbyPets");
 
 const app = express();
 const server = http.createServer(app);
@@ -78,21 +79,84 @@ function getAllDevicesWithStatus() {
   }));
 }
 
-function broadcastDevices() {
-  const allDevices = getAllDevicesWithStatus();
-  io.emit("devices", allDevices);
+async function broadcastDevices() {
+  try {
+    // Get all connected socket IDs and their user IDs
+    const sockets = await io.fetchSockets();
+    
+    for (const socket of sockets) {
+      const userId = socket.handshake.query.userId;
+      if (userId) {
+        try {
+          const userDevices = await getUserDevices(userId);
+          socket.emit("devices", userDevices);
+        } catch (error) {
+          console.error(`❌ Error sending devices to user ${userId}:`, error);
+          socket.emit("devices", []);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error in broadcastDevices:', error);
+  }
+}
+
+// Helper function to get user-specific devices
+async function getUserDevices(userId) {
+  try {
+    const connection = await pool.getConnection();
+    const [trackers] = await connection.query(
+      'SELECT device_id FROM trackers WHERE user_id = ?',
+      [userId]
+    );
+    
+    const [allAssignedTrackers] = await connection.query(
+      'SELECT device_id FROM trackers'
+    );
+    connection.release();
+    
+    const userDeviceIds = trackers.map(t => t.device_id);
+    const assignedDeviceIds = allAssignedTrackers.map(t => t.device_id);
+    const allDevices = getAllDevicesWithStatus();
+    
+    return allDevices.filter(device => 
+      userDeviceIds.includes(device.deviceId) || 
+      (!assignedDeviceIds.includes(device.deviceId) && device.isOnline)
+    );
+  } catch (error) {
+    console.error('❌ Error getting user devices:', error);
+    return [];
+  }
 }
 
 // SOCKET CONNECTION
-io.on("connection", (socket) => {
+io.on("connection", async (socket) => {
   console.log("🔌 Client connected via Socket.IO");
-  
-  const currentDevices = getAllDevicesWithStatus();
-  io.emit("devices", currentDevices);
-  console.log(`📡 Broadcasted ${currentDevices.length} devices to all clients`);
+
+  // Extract userId from query parameters or authentication
+  const userId = socket.handshake.query.userId;
+  if (!userId) {
+    console.error("❌ Missing userId in Socket.IO connection");
+    socket.disconnect();
+    return;
+  }
+
+  // Join the user-specific room
+  socket.join(userId);
+  console.log(`🔒 User ${userId} joined their room`);
+
+  // Send only the user's devices to the connected user
+  try {
+    const userDevices = await getUserDevices(userId);
+    socket.emit("devices", userDevices);
+    console.log(`📡 Sent ${userDevices.length} devices to user ${userId}`);
+  } catch (error) {
+    console.error(`❌ Error sending devices to user ${userId}:`, error);
+    socket.emit("devices", []);
+  }
 
   socket.on("disconnect", () => {
-    console.log("❌ Client disconnected");
+    console.log(`❌ User ${userId} disconnected`);
   });
 });
 
@@ -103,19 +167,20 @@ app.post("/data", async (req, res) => {
     const now = Date.now();
     const data = req.body;
 
-    if (!data || typeof data !== "object" || !data.deviceId) {
+    if (!data || typeof data !== "object" || !data.deviceId || !data.userId) {
       console.log("⚠️ Received invalid or empty JSON");
       return res.status(400).send("Invalid JSON payload");
     }
 
     const prevState = latestDevices[data.deviceId] || {};
-    
+
     latestDevices[data.deviceId] = {
       lat: data.lat,
       lng: data.lng,
       battery: data.battery,
       lastSeen: now,
       online: true,
+      userId: data.userId, 
     };
     
     if (data.battery !== undefined && data.battery <= 20 && 
@@ -456,6 +521,152 @@ app.post("/data", async (req, res) => {
       global.lastGeofenceState[data.deviceId] = insideGeofences;
     }
 
+    // Detect nearby pets within 10 meters using live data
+    const nearbyDevices = Object.entries(latestDevices)
+      .filter(([otherDeviceId, otherDevice]) => {
+        // Skip the same device
+        if (otherDeviceId === data.deviceId) return false;
+
+        const dx = otherDevice.lng - data.lng;
+        const dy = otherDevice.lat - data.lat;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        return distance <= 0.0001; // 10 meters in degrees (approximately 10 meters)
+      })
+      .map(([otherDeviceId, otherDevice]) => ({
+        deviceId: otherDeviceId,
+        lat: otherDevice.lat,
+        lng: otherDevice.lng,
+      }));
+
+    if (nearbyDevices.length > 0) {
+      try {
+        // Get owner information for all involved devices (current + nearby)
+        const allDeviceIds = [data.deviceId, ...nearbyDevices.map(d => d.deviceId)];
+        
+        const [ownerInfo] = await connection.query(
+          `SELECT t.device_id, t.user_id, t.pet_name, t.pet_type, t.pet_breed, u.first_name, u.last_name, u.email 
+           FROM trackers t 
+           JOIN users u ON t.user_id = u.user_id 
+           WHERE t.device_id IN (?)`,
+          [allDeviceIds]
+        );
+
+        // Group devices by their owners
+        const ownerGroups = {};
+        const deviceOwnerMap = {};
+        
+        ownerInfo.forEach(tracker => {
+          const userId = tracker.user_id;
+          const deviceId = tracker.device_id;
+          const petName = tracker.pet_name || 'Unnamed Pet';
+          const petType = tracker.pet_type || 'Unknown';
+          const petBreed = tracker.pet_breed || 'Unknown';
+          const ownerName = `${tracker.first_name || ''} ${tracker.last_name || ''}`.trim() || 
+                           tracker.email || 
+                           `User ${userId}`;
+          
+          // Get coordinates for this device
+          const deviceCoords = allDeviceIds.includes(deviceId) ? 
+            (deviceId === data.deviceId ? 
+              { lat: data.lat, lng: data.lng } : 
+              nearbyDevices.find(d => d.deviceId === deviceId)) : 
+            null;
+          
+          deviceOwnerMap[deviceId] = { userId, petName, petType, petBreed, ownerName };
+          
+          if (!ownerGroups[userId]) {
+            ownerGroups[userId] = [];
+          }
+          ownerGroups[userId].push({ 
+            deviceId, 
+            petName, 
+            petType,
+            petBreed,
+            lat: deviceCoords?.lat, 
+            lng: deviceCoords?.lng,
+            owner: { userId, petName, petType, petBreed, ownerName }
+          });
+        });
+
+        // Get unique user IDs involved
+        const involvedUserIds = Object.keys(ownerGroups);
+        
+        if (involvedUserIds.length > 1) { // Only notify if pets from different owners are nearby
+          console.log(`🐾 Nearby pets detected from different owners:`, ownerGroups);
+
+          // Determine if we should group pets or treat them individually
+          const shouldGroupPets = Object.values(ownerGroups).some(pets => pets.length > 1);
+          
+          let nearbyPetsData;
+          
+          if (shouldGroupPets) {
+            // Group format: when multiple pets from same owner(s) are involved
+            nearbyPetsData = {
+              type: 'grouped',
+              involvedUsers: involvedUserIds,
+              ownerGroups: ownerGroups,
+              triggerDevice: {
+                deviceId: data.deviceId,
+                owner: deviceOwnerMap[data.deviceId],
+                lat: data.lat,
+                lng: data.lng
+              },
+              nearbyDevices: nearbyDevices.map(device => ({
+                ...device,
+                owner: deviceOwnerMap[device.deviceId]
+              }))
+            };
+          } else {
+            // Individual format: when only one pet per owner is involved
+            const allPets = [];
+            
+            // Add trigger device
+            allPets.push({
+              deviceId: data.deviceId,
+              petName: deviceOwnerMap[data.deviceId]?.petName || 'Unnamed Pet',
+              petType: deviceOwnerMap[data.deviceId]?.petType || 'Unknown',
+              petBreed: deviceOwnerMap[data.deviceId]?.petBreed || 'Unknown',
+              userId: deviceOwnerMap[data.deviceId]?.userId,
+              ownerName: deviceOwnerMap[data.deviceId]?.ownerName || `User ${deviceOwnerMap[data.deviceId]?.userId}`,
+              lat: data.lat,
+              lng: data.lng,
+              isTrigger: true
+            });
+            
+            // Add nearby devices
+            nearbyDevices.forEach(device => {
+              allPets.push({
+                deviceId: device.deviceId,
+                petName: deviceOwnerMap[device.deviceId]?.petName || 'Unnamed Pet',
+                petType: deviceOwnerMap[device.deviceId]?.petType || 'Unknown',
+                petBreed: deviceOwnerMap[device.deviceId]?.petBreed || 'Unknown',
+                userId: deviceOwnerMap[device.deviceId]?.userId,
+                ownerName: deviceOwnerMap[device.deviceId]?.ownerName || `User ${deviceOwnerMap[device.deviceId]?.userId}`,
+                lat: device.lat,
+                lng: device.lng,
+                isTrigger: false
+              });
+            });
+
+            nearbyPetsData = {
+              type: 'individual',
+              involvedUsers: involvedUserIds,
+              pets: allPets
+            };
+          }
+
+          // Notify all involved users
+          involvedUserIds.forEach(userId => {
+            console.log(`📱 Notifying user ${userId} about nearby pets (${nearbyPetsData.type})`);
+            io.to(userId).emit("nearby-pets", nearbyPetsData);
+          });
+        }
+      } catch (nearbyError) {
+        console.error(`❌ Error processing nearby pets detection:`, nearbyError.message);
+      }
+    }
+
     console.log("📥 Received from device:", data);
     broadcastDevices();
     res.status(200).send("✅ Data received");
@@ -581,29 +792,31 @@ setInterval(() => {
 // SIMULATION LOGIC
 let simulationIntervals = {};
 let simulatedDevices = {};
+const MEETUP_POINT = { lat: 8.092, lng: 123.490 };
 
 function startSimulation(deviceId, batteryOverride = null) {
   if (simulationIntervals[deviceId]) return;
 
   const angle = Math.random() * 2 * Math.PI;
+  const distance = 0.0005 + Math.random() * 0.0005; 
   simulatedDevices[deviceId] = {
     angle,
     position: {
-      lat: 8.090881 + Math.random() * 0.002,
-      lng: 123.488679 + Math.random() * 0.002,
+      lat: MEETUP_POINT.lat + Math.cos(angle) * distance,
+      lng: MEETUP_POINT.lng + Math.sin(angle) * distance,
     },
   };
 
   simulationIntervals[deviceId] = setInterval(async () => {
     const device = simulatedDevices[deviceId];
-    device.angle += (Math.random() - 0.5) * 0.4;
 
-    const speed = 0.000015;
-    const dx = Math.cos(device.angle) * speed;
-    const dy = Math.sin(device.angle) * speed;
+    const dx = MEETUP_POINT.lng - device.position.lng;
+    const dy = MEETUP_POINT.lat - device.position.lat;
+    const distanceToMeetup = Math.sqrt(dx * dx + dy * dy);
 
-    device.position.lat += dy;
-    device.position.lng += dx;
+    const speed = 0.00002; 
+    device.position.lng += (dx / distanceToMeetup) * speed;
+    device.position.lat += (dy / distanceToMeetup) * speed;
 
     const batteryLevel = batteryOverride ?? Math.floor(50 + Math.random() * 50);
 
@@ -612,10 +825,11 @@ function startSimulation(deviceId, batteryOverride = null) {
       lat: device.position.lat,
       lng: device.position.lng,
       battery: batteryLevel,
+      userId: "demo-user", // Default user for simulation
     };
 
     try {
-      await axios.post(`${process.env.SERVER_URL}/data`, payload);
+      await axios.post(process.env.SERVER_URL + `/data`, payload);
     } catch (err) {
       console.error(
         `❌ Failed to send simulated data for ${deviceId}:`,
@@ -1424,7 +1638,7 @@ app.post("/api/user-profile", async (req, res) => {
     connection = await pool.getConnection();
 
     const [rows] = await connection.query(
-      "SELECT user_id, first_name, last_name, phone, email, username, email_verification, phone_verification FROM users WHERE email = ? OR username = ?",
+      "SELECT user_id, first_name, last_name, phone, email, username, email_verification, phone_verification, profile_photo FROM users WHERE email = ? OR username = ?",
       [email || "", username || ""]
     );
 
@@ -1432,9 +1646,137 @@ app.post("/api/user-profile", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    return res.status(200).json({ user: rows[0] });
+    // Convert profile_photo BLOB to base64 if it exists
+    const user = rows[0];
+    if (user.profile_photo) {
+      user.profile_photo = user.profile_photo.toString('base64');
+    }
+
+    return res.status(200).json({ user });
   } catch (err) {
     console.error("User profile fetch error:", err.message);
+    return res.status(500).json({ message: "Server error" });
+  } finally {
+    try {
+      if (connection) connection.release();
+    } catch (e) {
+      console.warn("Failed to release MySQL connection:", e.message);
+    }
+  }
+});
+
+// UPDATE USER PROFILE
+app.put("/api/user-profile", async (req, res) => {
+  let connection;
+  try {
+    const { 
+      user_id, 
+      first_name, 
+      last_name, 
+      phone, 
+      email, 
+      username, 
+      profile_photo 
+    } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({ message: "User ID is required" });
+    }
+
+    connection = await pool.getConnection();
+
+    // Check if user exists
+    const [existingUser] = await connection.query(
+      "SELECT user_id FROM users WHERE user_id = ?",
+      [user_id]
+    );
+
+    if (existingUser.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Check for duplicate email or username (excluding current user)
+    if (email || username) {
+      const [duplicates] = await connection.query(
+        "SELECT email, username FROM users WHERE (email = ? OR username = ?) AND user_id != ?",
+        [email || "", username || "", user_id]
+      );
+
+      if (duplicates.length > 0) {
+        const duplicate = duplicates[0];
+        let message = "";
+        if (duplicate.email === email) message = "Email already exists";
+        if (duplicate.username === username) message = "Username already exists";
+        return res.status(409).json({ message });
+      }
+    }
+
+    // Prepare update query
+    let updateFields = [];
+    let updateValues = [];
+
+    if (first_name !== undefined) {
+      updateFields.push("first_name = ?");
+      updateValues.push(first_name);
+    }
+    if (last_name !== undefined) {
+      updateFields.push("last_name = ?");
+      updateValues.push(last_name);
+    }
+    if (phone !== undefined) {
+      updateFields.push("phone = ?");
+      updateValues.push(phone);
+    }
+    if (email !== undefined) {
+      updateFields.push("email = ?");
+      updateValues.push(email);
+    }
+    if (username !== undefined) {
+      updateFields.push("username = ?");
+      updateValues.push(username);
+    }
+    if (profile_photo !== undefined) {
+      updateFields.push("profile_photo = ?");
+      // Convert base64 to buffer if profile_photo is provided, otherwise set to null
+      if (profile_photo && typeof profile_photo === "string") {
+        const base64Data = profile_photo.replace(/^data:image\/[a-z]+;base64,/, "");
+        updateValues.push(Buffer.from(base64Data, "base64"));
+      } else {
+        updateValues.push(null);
+      }
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({ message: "No fields to update" });
+    }
+
+    updateValues.push(user_id);
+
+    const updateQuery = `UPDATE users SET ${updateFields.join(", ")} WHERE user_id = ?`;
+    
+    const [result] = await connection.query(updateQuery, updateValues);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Fetch updated user data
+    const [updatedUser] = await connection.query(
+      "SELECT user_id, first_name, last_name, phone, email, username, email_verification, phone_verification, profile_photo FROM users WHERE user_id = ?",
+      [user_id]
+    );
+
+    const user = updatedUser[0];
+    if (user.profile_photo) {
+      user.profile_photo = user.profile_photo.toString('base64');
+    }
+
+    return res.status(200).json({ 
+      message: "Profile updated successfully", 
+      user 
+    });
+  } catch (err) {
+    console.error("User profile update error:", err.message);
     return res.status(500).json({ message: "Server error" });
   } finally {
     try {
@@ -1563,6 +1905,8 @@ app.post("/api/sms-notification-settings/:userId", async (req, res) => {
       out_geofence,
       in_geofence,
       low_battery,
+      nearby_pet,
+      meter_radius,
     } = req.body;
 
     connection = await pool.getConnection();
@@ -1577,8 +1921,8 @@ app.post("/api/sms-notification-settings/:userId", async (req, res) => {
     }
 
     await connection.query(
-      `INSERT INTO sms_notification_settings (user_id, enable_sms_notification, online, offline, out_geofence, in_geofence, low_battery)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO sms_notification_settings (user_id, enable_sms_notification, online, offline, out_geofence, in_geofence, low_battery, nearby_pet, meter_radius)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         userId,
         enable_sms_notification,
@@ -1587,6 +1931,8 @@ app.post("/api/sms-notification-settings/:userId", async (req, res) => {
         out_geofence,
         in_geofence,
         low_battery,
+        nearby_pet,
+        meter_radius,
       ]
     );
 
@@ -1608,7 +1954,7 @@ app.get("/api/sms-notification-settings/:userId", async (req, res) => {
     connection = await pool.getConnection();
 
     const [rows] = await connection.query(
-      `SELECT sms_setting_id, enable_sms_notification, online, offline, out_geofence, in_geofence, low_battery
+      `SELECT sms_setting_id, enable_sms_notification, online, offline, out_geofence, in_geofence, low_battery, nearby_pet, meter_radius
        FROM sms_notification_settings
        WHERE user_id = ?`,
       [userId]
@@ -1635,13 +1981,15 @@ app.put("/api/sms-notification-settings/:userId", async (req, res) => {
       out_geofence,
       in_geofence,
       low_battery,
+      nearby_pet,
+      meter_radius,
     } = req.body;
 
     connection = await pool.getConnection();
 
     await connection.query(
       `UPDATE sms_notification_settings
-       SET enable_sms_notification = ?, online = ?, offline = ?, out_geofence = ?, in_geofence = ?, low_battery = ?
+       SET enable_sms_notification = ?, online = ?, offline = ?, out_geofence = ?, in_geofence = ?, low_battery = ?, nearby_pet = ?, meter_radius = ?
        WHERE user_id = ?`,
       [
         enable_sms_notification,
@@ -1650,6 +1998,8 @@ app.put("/api/sms-notification-settings/:userId", async (req, res) => {
         out_geofence,
         in_geofence,
         low_battery,
+        nearby_pet,
+        meter_radius,
         userId,
       ]
     );
