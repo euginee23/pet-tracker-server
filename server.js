@@ -11,10 +11,23 @@ require("dotenv").config();
 
 const isInsideGeofence = require("./utils/isInsideGeofence");
 const { sendSMS } = require("./utils/sms");
-const { sendOTPSMS, generateOTPCode, validateOTPCode } = require("./utils/otp_sms");
+const {
+  sendOTPSMS,
+  generateOTPCode,
+  validateOTPCode,
+} = require("./utils/otp_sms");
 const notificationHelper = require("./utils/notifications");
-const { getTrackerOwnerPhone, isNotificationEnabled } = require("./utils/userNotificationUtils");
+const {
+  getTrackerOwnerPhone,
+  isNotificationEnabled,
+} = require("./utils/userNotificationUtils");
 const detectNearbyPets = require("./utils/detectNearbyPets");
+const {
+  getCachedUserId,
+  cacheDeviceUser,
+  clearCachedDevice
+} = require("./utils/deviceCache");
+const { executeWithRetry, queryWithRetry } = require("./utils/dbRetry");
 
 const app = express();
 const server = http.createServer(app);
@@ -47,8 +60,6 @@ const pool = mysql.createPool({
     const connection = await pool.getConnection();
     console.log("✅ Successfully connected to the database.");
     connection.release();
-    
-    // Initialize the notification helper with our pool
     notificationHelper.initialize(pool);
   } catch (err) {
     console.error("❌ Error connecting to the database:", err.message || err);
@@ -64,7 +75,7 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-const CHECK_INTERVAL = 10000;
+const CHECK_INTERVAL = 15000;
 let latestDevices = {};
 let deviceStatus = {};
 
@@ -84,7 +95,7 @@ async function broadcastDevices() {
   try {
     // Get all connected socket IDs and their user IDs
     const sockets = await io.fetchSockets();
-    
+
     for (const socket of sockets) {
       const userId = socket.handshake.query.userId;
       if (userId) {
@@ -98,7 +109,7 @@ async function broadcastDevices() {
       }
     }
   } catch (error) {
-    console.error('❌ Error in broadcastDevices:', error);
+    console.error("❌ Error in broadcastDevices:", error);
   }
 }
 
@@ -107,25 +118,26 @@ async function getUserDevices(userId) {
   try {
     const connection = await pool.getConnection();
     const [trackers] = await connection.query(
-      'SELECT device_id FROM trackers WHERE user_id = ?',
+      "SELECT device_id FROM trackers WHERE user_id = ?",
       [userId]
     );
-    
+
     const [allAssignedTrackers] = await connection.query(
-      'SELECT device_id FROM trackers'
+      "SELECT device_id FROM trackers"
     );
     connection.release();
-    
-    const userDeviceIds = trackers.map(t => t.device_id);
-    const assignedDeviceIds = allAssignedTrackers.map(t => t.device_id);
+
+    const userDeviceIds = trackers.map((t) => t.device_id);
+    const assignedDeviceIds = allAssignedTrackers.map((t) => t.device_id);
     const allDevices = getAllDevicesWithStatus();
-    
-    return allDevices.filter(device => 
-      userDeviceIds.includes(device.deviceId) || 
-      (!assignedDeviceIds.includes(device.deviceId) && device.isOnline)
+
+    return allDevices.filter(
+      (device) =>
+        userDeviceIds.includes(device.deviceId) ||
+        (!assignedDeviceIds.includes(device.deviceId) && device.isOnline)
     );
   } catch (error) {
-    console.error('❌ Error getting user devices:', error);
+    console.error("❌ Error getting user devices:", error);
     return [];
   }
 }
@@ -168,9 +180,35 @@ app.post("/data", async (req, res) => {
     const now = Date.now();
     const data = req.body;
 
-    if (!data || typeof data !== "object" || !data.deviceId || !data.userId) {
+    if (!data || typeof data !== "object" || !data.deviceId) {
       console.log("⚠️ Received invalid or empty JSON");
       return res.status(400).send("Invalid JSON payload");
+    }
+    
+    if (!data.userId) {
+      const cachedUserId = getCachedUserId(data.deviceId);
+      
+      if (cachedUserId) {
+        data.userId = cachedUserId;
+      } else {
+        try {
+          const trackerInfo = await queryWithRetry(
+            pool,
+            `SELECT user_id FROM trackers WHERE device_id = ? LIMIT 1`,
+            [data.deviceId]
+          );
+          
+          if (trackerInfo.length > 0) {
+            data.userId = trackerInfo[0].user_id;
+            cacheDeviceUser(data.deviceId, data.userId);
+            console.log(`ℹ️ Found and cached userId ${data.userId} for device ${data.deviceId}`);
+          } else {
+            console.log(`⚠️ No userId found for device ${data.deviceId}`);
+          }
+        } catch (lookupError) {
+          console.error(`❌ Error looking up userId for device ${data.deviceId}:`, lookupError.message);
+        }
+      }
     }
 
     const prevState = latestDevices[data.deviceId] || {};
@@ -181,156 +219,215 @@ app.post("/data", async (req, res) => {
       battery: data.battery,
       lastSeen: now,
       online: true,
-      userId: data.userId, 
+      userId: data.userId,
     };
-    
-    if (data.battery !== undefined && data.battery <= 20 && 
-        (prevState.battery === undefined || prevState.battery > 20)) {
+
+    if (
+      data.battery !== undefined &&
+      data.battery <= 20 &&
+      (prevState.battery === undefined || prevState.battery > 20)
+    ) {
       try {
         let batteryConnection = await pool.getConnection();
         const [trackers] = await batteryConnection.query(
-          `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
+          `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
           [data.deviceId]
         );
         batteryConnection.release();
-        
+
         for (const tracker of trackers) {
           const userId = tracker.user_id;
           const petName = tracker.pet_name || "Your pet";
-          
+
           await notificationHelper.createNotification(
             io,
             userId,
             data.deviceId,
             `⚠️ ${petName}'s tracker battery is low (${data.battery}%)`,
-            'alert'
+            "alert"
           );
-          
+
           // SMS NOTIFICATION FOR LOW BATTERY
           try {
-            console.log(`🔋 Checking low battery notification settings for user ${userId}`);
-            
+            console.log(
+              `🔋 Checking low battery notification settings for user ${userId}`
+            );
+
             let settingsConn = await pool.getConnection();
             const [settings] = await settingsConn.query(
-              `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+              `SELECT * FROM sms_notification_settings WHERE user_id = ?`,
               [userId]
             );
             settingsConn.release();
-            
+
             if (settings.length > 0) {
-              console.log(`📋 Raw low battery settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+              console.log(
+                `📋 Raw low battery settings from database for user ${userId}:`,
+                JSON.stringify(settings[0])
+              );
             } else {
               console.log(`⚠️ No SMS settings found for user ${userId}`);
               continue;
             }
-            
-            const notificationEnabled = await isNotificationEnabled(pool, userId, 'low_battery');
-            
+
+            const notificationEnabled = await isNotificationEnabled(
+              pool,
+              userId,
+              "low_battery"
+            );
+
             if (!notificationEnabled) {
-              console.log(`ℹ️ User ${userId} has disabled SMS notifications for low battery events`);
+              console.log(
+                `ℹ️ User ${userId} has disabled SMS notifications for low battery events`
+              );
               continue;
             } else {
-              console.log(`✅ User ${userId} has enabled SMS notifications for low battery events`);
+              console.log(
+                `✅ User ${userId} has enabled SMS notifications for low battery events`
+              );
             }
-            
-            const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
-            
+
+            const { phoneNumber } = await getTrackerOwnerPhone(
+              pool,
+              data.deviceId
+            );
+
             if (!phoneNumber) {
-              console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+              console.warn(
+                `⚠️ No valid phone number for user ${userId}, skipping SMS notification`
+              );
               continue;
             }
-            
-            console.log(`📱 Sending SMS for low battery: ${petName}'s tracker at ${data.battery}% to ${phoneNumber}`);
-            
+
+            console.log(
+              `📱 Sending SMS for low battery: ${petName}'s tracker at ${data.battery}% to ${phoneNumber}`
+            );
+
             const smsResponse = await sendSMS(
               phoneNumber,
-              `⚠️ ALERT: ${petName}'s tracker battery is low (${data.battery}%). Please charge soon. Time: ${new Date().toLocaleString()}`
+              `⚠️ ALERT: ${petName}'s tracker battery is low (${
+                data.battery
+              }%). Please charge soon. Time: ${new Date().toLocaleString()}`
             );
-            
+
             console.log(`✅ SMS sent for low battery`, smsResponse);
           } catch (smsError) {
-            console.error(`❌ Failed to send SMS for low battery:`, smsError.message);
+            console.error(
+              `❌ Failed to send SMS for low battery:`,
+              smsError.message
+            );
           }
         }
       } catch (batteryError) {
-        console.error(`❌ Error processing low battery notification:`, batteryError.message);
+        console.error(
+          `❌ Error processing low battery notification:`,
+          batteryError.message
+        );
       }
     }
 
     if (deviceStatus[data.deviceId] !== "online") {
       console.log(`🟢 ${data.deviceId} is now ONLINE`);
       deviceStatus[data.deviceId] = "online";
-      
+
       try {
         connection = await pool.getConnection();
         const [trackers] = await connection.query(
-          `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
+          `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
           [data.deviceId]
         );
         connection.release();
-        
+
         for (const tracker of trackers) {
           const petName = tracker.pet_name || "Your pet";
           const message = `${petName}'s tracker (${data.deviceId}) is now ONLINE`;
-          
+
           await notificationHelper.createNotification(
             io,
-            tracker.user_id, 
-            data.deviceId, 
+            tracker.user_id,
+            data.deviceId,
             message,
-            'normal'
+            "normal"
           );
         }
-        
+
         // SMS NOTIFICATION FOR DEVICE ONLINE STATUS
         try {
           for (const tracker of trackers) {
             const userId = tracker.user_id;
-            
-            console.log(`🔎 Checking online notification settings for user ${userId} and device ${data.deviceId}`);
-            
+
+            console.log(
+              `🔎 Checking online notification settings for user ${userId} and device ${data.deviceId}`
+            );
+
             let connection = await pool.getConnection();
             const [settings] = await connection.query(
-              `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+              `SELECT * FROM sms_notification_settings WHERE user_id = ?`,
               [userId]
             );
             connection.release();
-            
+
             if (settings.length > 0) {
-              console.log(`📋 Raw settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+              console.log(
+                `📋 Raw settings from database for user ${userId}:`,
+                JSON.stringify(settings[0])
+              );
             } else {
               console.log(`⚠️ No SMS settings found for user ${userId}`);
               continue;
             }
-            
-            const notificationEnabled = await isNotificationEnabled(pool, userId, 'online');
-            
+
+            const notificationEnabled = await isNotificationEnabled(
+              pool,
+              userId,
+              "online"
+            );
+
             if (!notificationEnabled) {
-              console.log(`ℹ️ User ${userId} has disabled SMS notifications for online events`);
+              console.log(
+                `ℹ️ User ${userId} has disabled SMS notifications for online events`
+              );
               continue;
             } else {
-              console.log(`✅ User ${userId} has enabled SMS notifications for online events`);
+              console.log(
+                `✅ User ${userId} has enabled SMS notifications for online events`
+              );
             }
-            
-            const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
-            
+
+            const { phoneNumber } = await getTrackerOwnerPhone(
+              pool,
+              data.deviceId
+            );
+
             if (!phoneNumber) {
-              console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+              console.warn(
+                `⚠️ No valid phone number for user ${userId}, skipping SMS notification`
+              );
               continue;
             }
-            
+
             const petName = tracker.pet_name || "Your pet";
-            console.log(`📱 Sending SMS notification for ${data.deviceId} going online to ${phoneNumber}`);
-            
+            console.log(
+              `📱 Sending SMS notification for ${data.deviceId} going online to ${phoneNumber}`
+            );
+
             const smsResponse = await sendSMS(
               phoneNumber,
-              `${petName}'s tracker (${data.deviceId}) is now ONLINE. Time: ${new Date().toLocaleString()}`
+              `${petName}'s tracker (${
+                data.deviceId
+              }) is now ONLINE. Time: ${new Date().toLocaleString()}`
             );
-            
-            console.log(`✅ SMS notification sent for device ${data.deviceId}`, smsResponse);
+
+            console.log(
+              `✅ SMS notification sent for device ${data.deviceId}`,
+              smsResponse
+            );
           }
         } catch (smsError) {
-          console.error(`❌ Failed to send SMS notification:`, smsError.message);
+          console.error(
+            `❌ Failed to send SMS notification:`,
+            smsError.message
+          );
         }
       } catch (notifError) {
         console.error(`❌ Error creating online notification:`, notifError);
@@ -340,14 +437,14 @@ app.post("/data", async (req, res) => {
     if (!global.lastGeofenceState) global.lastGeofenceState = {};
     const lastState = global.lastGeofenceState[data.deviceId] || [];
 
-    connection = await pool.getConnection();
-    const [geofences] = await connection.query(
+    const geofences = await queryWithRetry(
+      pool,
       `
-    SELECT g.*
-    FROM geofences g
-    JOIN geofence_assignment ga ON g.geofence_id = ga.geofence_id
-    WHERE ga.device_id = ?
-  `,
+      SELECT g.*
+      FROM geofences g
+      JOIN geofence_assignment ga ON g.geofence_id = ga.geofence_id
+      WHERE ga.device_id = ?
+      `,
       [data.deviceId]
     );
 
@@ -369,144 +466,203 @@ app.post("/data", async (req, res) => {
         geofenceDistances.push({
           geofenceId: geofence.geofence_id,
           geofenceName: geofence.geofence_name || geofence.geofence_id,
-          distance: result.distance
+          distance: result.distance,
         });
       }
 
       // GET PET NAME FOR NOTIFICATIONS
-      const [trackerInfo] = await connection.query(
+      const trackerInfo = await queryWithRetry(
+        pool,
         `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
         [data.deviceId]
       );
-        
+
       for (const geofence of geofences) {
         const geofenceId = geofence.geofence_id;
         const geofenceName = geofence.geofence_name || geofenceId;
         const wasInside = lastState.includes(geofenceId);
         const isNowInside = insideGeofences.includes(geofenceId);
-        const distObj = geofenceDistances.find(gd => gd.geofenceId === geofenceId);
-        
+        const distObj = geofenceDistances.find(
+          (gd) => gd.geofenceId === geofenceId
+        );
+
         for (const tracker of trackerInfo) {
           const petName = tracker.pet_name || "Your pet";
-          
+
           if (!wasInside && isNowInside) {
-            console.log(`✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`);
-            
+            console.log(
+              `✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`
+            );
+
             await notificationHelper.createNotification(
               io,
               tracker.user_id,
               data.deviceId,
               `${petName} has entered the "${geofenceName}" geofence zone`,
-              'normal'
+              "normal"
             );
-            
+
             // SMS NOTIFICATION FOR GEOFENCE ENTRY
             try {
               const userId = tracker.user_id;
-              console.log(`🔎 Checking geofence entry notification settings for user ${userId}`);
-              
+              console.log(
+                `🔎 Checking geofence entry notification settings for user ${userId}`
+              );
+
               // Get raw notification settings first to debug
               let settingsConn = await pool.getConnection();
               const [settings] = await settingsConn.query(
-                `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+                `SELECT * FROM sms_notification_settings WHERE user_id = ?`,
                 [userId]
               );
               settingsConn.release();
-              
+
               if (settings.length > 0) {
-                console.log(`📋 Raw geofence entry settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+                console.log(
+                  `📋 Raw geofence entry settings from database for user ${userId}:`,
+                  JSON.stringify(settings[0])
+                );
               } else {
                 console.log(`⚠️ No SMS settings found for user ${userId}`);
                 continue;
               }
-              
-              const notificationEnabled = await isNotificationEnabled(pool, userId, 'in_geofence');
-              
+
+              const notificationEnabled = await isNotificationEnabled(
+                pool,
+                userId,
+                "in_geofence"
+              );
+
               if (!notificationEnabled) {
-                console.log(`ℹ️ User ${userId} has disabled SMS notifications for geofence entry events`);
+                console.log(
+                  `ℹ️ User ${userId} has disabled SMS notifications for geofence entry events`
+                );
                 continue;
               } else {
-                console.log(`✅ User ${userId} has enabled SMS notifications for geofence entry events`);
+                console.log(
+                  `✅ User ${userId} has enabled SMS notifications for geofence entry events`
+                );
               }
-              
-              const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
-              
+
+              const { phoneNumber } = await getTrackerOwnerPhone(
+                pool,
+                data.deviceId
+              );
+
               if (!phoneNumber) {
-                console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+                console.warn(
+                  `⚠️ No valid phone number for user ${userId}, skipping SMS notification`
+                );
                 continue;
               }
-              
-              console.log(`📱 Sending SMS for geofence entry: ${petName} entered ${geofenceName} to ${phoneNumber}`);
-              
+
+              console.log(
+                `📱 Sending SMS for geofence entry: ${petName} entered ${geofenceName} to ${phoneNumber}`
+              );
+
               const smsResponse = await sendSMS(
                 phoneNumber,
                 `${petName} has ENTERED the "${geofenceName}" geofence zone. Time: ${new Date().toLocaleString()}`
               );
-              
+
               console.log(`✅ SMS sent for geofence entry`, smsResponse);
             } catch (smsError) {
-              console.error(`❌ Failed to send SMS for geofence entry:`, smsError.message);
+              console.error(
+                `❌ Failed to send SMS for geofence entry:`,
+                smsError.message
+              );
             }
           } else if (wasInside && isNowInside) {
-            console.log(`✅ Pet ${data.deviceId} is inside geofence (${geofenceName})`);
+            console.log(
+              `✅ Pet ${data.deviceId} is inside geofence (${geofenceName})`
+            );
           } else if (wasInside && !isNowInside) {
-            console.warn(`⚠️ Pet ${data.deviceId} is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(2)}m away)`);
-            
+            console.warn(
+              `⚠️ Pet ${
+                data.deviceId
+              } is now outside geofence (${geofenceName}) (~${distObj.distance.toFixed(
+                2
+              )}m away)`
+            );
+
             // "LEFT GEOFENCE" NOTIFICATION
             await notificationHelper.createNotification(
               io,
               tracker.user_id,
               data.deviceId,
               `⚠️ ${petName} has left the "${geofenceName}" geofence zone!`,
-              'alert' 
+              "alert"
             );
-            
+
             // SMS NOTIFICATION FOR GEOFENCE EXIT
             try {
               const userId = tracker.user_id;
-              console.log(`🔎 Checking geofence exit notification settings for user ${userId}`);
-              
+              console.log(
+                `🔎 Checking geofence exit notification settings for user ${userId}`
+              );
+
               // Get raw notification settings first to debug
               let settingsConn = await pool.getConnection();
               const [settings] = await settingsConn.query(
-                `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+                `SELECT * FROM sms_notification_settings WHERE user_id = ?`,
                 [userId]
               );
               settingsConn.release();
-              
+
               if (settings.length > 0) {
-                console.log(`📋 Raw geofence exit settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+                console.log(
+                  `📋 Raw geofence exit settings from database for user ${userId}:`,
+                  JSON.stringify(settings[0])
+                );
               } else {
                 console.log(`⚠️ No SMS settings found for user ${userId}`);
                 continue;
               }
-              
-              const notificationEnabled = await isNotificationEnabled(pool, userId, 'out_geofence');
-              
+
+              const notificationEnabled = await isNotificationEnabled(
+                pool,
+                userId,
+                "out_geofence"
+              );
+
               if (!notificationEnabled) {
-                console.log(`ℹ️ User ${userId} has disabled SMS notifications for geofence exit events`);
+                console.log(
+                  `ℹ️ User ${userId} has disabled SMS notifications for geofence exit events`
+                );
                 continue;
               } else {
-                console.log(`✅ User ${userId} has enabled SMS notifications for geofence exit events`);
+                console.log(
+                  `✅ User ${userId} has enabled SMS notifications for geofence exit events`
+                );
               }
-              
-              const { phoneNumber } = await getTrackerOwnerPhone(pool, data.deviceId);
-              
+
+              const { phoneNumber } = await getTrackerOwnerPhone(
+                pool,
+                data.deviceId
+              );
+
               if (!phoneNumber) {
-                console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+                console.warn(
+                  `⚠️ No valid phone number for user ${userId}, skipping SMS notification`
+                );
                 continue;
               }
-              
-              console.log(`📱 Sending SMS for geofence exit: ${petName} left ${geofenceName} to ${phoneNumber}`);
-              
+
+              console.log(
+                `📱 Sending SMS for geofence exit: ${petName} left ${geofenceName} to ${phoneNumber}`
+              );
+
               const smsResponse = await sendSMS(
                 phoneNumber,
                 `⚠️ ALERT: ${petName} has LEFT the "${geofenceName}" geofence zone! Time: ${new Date().toLocaleString()}`
               );
-              
+
               console.log(`✅ SMS sent for geofence exit`, smsResponse);
             } catch (smsError) {
-              console.error(`❌ Failed to send SMS for geofence exit:`, smsError.message);
+              console.error(
+                `❌ Failed to send SMS for geofence exit:`,
+                smsError.message
+              );
             }
           }
         }
@@ -514,168 +670,406 @@ app.post("/data", async (req, res) => {
 
       if (insideGeofences.length === 0) {
         const distMsg = geofenceDistances
-          .map(gd => `${gd.geofenceName} ~${gd.distance.toFixed(2)}m`)
+          .map((gd) => `${gd.geofenceName} ~${gd.distance.toFixed(2)}m`)
           .join(", ");
-        console.warn(`⚠️ Pet ${data.deviceId} is now outside all geofences: ${distMsg}`);
+        console.warn(
+          `⚠️ Pet ${data.deviceId} is now outside all geofences: ${distMsg}`
+        );
       }
 
       global.lastGeofenceState[data.deviceId] = insideGeofences;
     }
 
-    // Detect nearby pets within 10 meters using live data
-    const nearbyDevices = Object.entries(latestDevices)
-      .filter(([otherDeviceId, otherDevice]) => {
-        // Skip the same device
-        if (otherDeviceId === data.deviceId) return false;
-
-        const dx = otherDevice.lng - data.lng;
-        const dy = otherDevice.lat - data.lat;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-
-        return distance <= 0.0001; // 10 meters in degrees (approximately 10 meters)
-      })
-      .map(([otherDeviceId, otherDevice]) => ({
-        deviceId: otherDeviceId,
-        lat: otherDevice.lat,
-        lng: otherDevice.lng,
-      }));
-
-    if (nearbyDevices.length > 0) {
-      try {
-        // Get owner information for all involved devices (current + nearby)
-        const allDeviceIds = [data.deviceId, ...nearbyDevices.map(d => d.deviceId)];
-        
-        const [ownerInfo] = await connection.query(
-          `SELECT t.device_id, t.user_id, t.pet_name, t.pet_type, t.pet_breed, u.first_name, u.last_name, u.email 
-           FROM trackers t 
-           JOIN users u ON t.user_id = u.user_id 
-           WHERE t.device_id IN (?)`,
-          [allDeviceIds]
-        );
-
-        // Group devices by their owners
-        const ownerGroups = {};
-        const deviceOwnerMap = {};
-        
-        ownerInfo.forEach(tracker => {
-          const userId = tracker.user_id;
-          const deviceId = tracker.device_id;
-          const petName = tracker.pet_name || 'Unnamed Pet';
-          const petType = tracker.pet_type || 'Unknown';
-          const petBreed = tracker.pet_breed || 'Unknown';
-          const ownerName = `${tracker.first_name || ''} ${tracker.last_name || ''}`.trim() || 
-                           tracker.email || 
-                           `User ${userId}`;
-          
-          // Get coordinates for this device
-          const deviceCoords = allDeviceIds.includes(deviceId) ? 
-            (deviceId === data.deviceId ? 
-              { lat: data.lat, lng: data.lng } : 
-              nearbyDevices.find(d => d.deviceId === deviceId)) : 
-            null;
-          
-          deviceOwnerMap[deviceId] = { userId, petName, petType, petBreed, ownerName };
-          
-          if (!ownerGroups[userId]) {
-            ownerGroups[userId] = [];
-          }
-          ownerGroups[userId].push({ 
-            deviceId, 
-            petName, 
-            petType,
-            petBreed,
-            lat: deviceCoords?.lat, 
-            lng: deviceCoords?.lng,
-            owner: { userId, petName, petType, petBreed, ownerName }
-          });
-        });
-
-        // Get unique user IDs involved
-        const involvedUserIds = Object.keys(ownerGroups);
-        
-        if (involvedUserIds.length > 1) { // Only notify if pets from different owners are nearby
-          console.log(`🐾 Nearby pets detected from different owners:`, ownerGroups);
-
-          // Determine if we should group pets or treat them individually
-          const shouldGroupPets = Object.values(ownerGroups).some(pets => pets.length > 1);
-          
-          let nearbyPetsData;
-          
-          if (shouldGroupPets) {
-            // Group format: when multiple pets from same owner(s) are involved
-            nearbyPetsData = {
-              type: 'grouped',
-              involvedUsers: involvedUserIds,
-              ownerGroups: ownerGroups,
-              triggerDevice: {
-                deviceId: data.deviceId,
-                owner: deviceOwnerMap[data.deviceId],
-                lat: data.lat,
-                lng: data.lng
-              },
-              nearbyDevices: nearbyDevices.map(device => ({
-                ...device,
-                owner: deviceOwnerMap[device.deviceId]
-              }))
-            };
-          } else {
-            // Individual format: when only one pet per owner is involved
-            const allPets = [];
-            
-            // Add trigger device
-            allPets.push({
-              deviceId: data.deviceId,
-              petName: deviceOwnerMap[data.deviceId]?.petName || 'Unnamed Pet',
-              petType: deviceOwnerMap[data.deviceId]?.petType || 'Unknown',
-              petBreed: deviceOwnerMap[data.deviceId]?.petBreed || 'Unknown',
-              userId: deviceOwnerMap[data.deviceId]?.userId,
-              ownerName: deviceOwnerMap[data.deviceId]?.ownerName || `User ${deviceOwnerMap[data.deviceId]?.userId}`,
-              lat: data.lat,
-              lng: data.lng,
-              isTrigger: true
-            });
-            
-            // Add nearby devices
-            nearbyDevices.forEach(device => {
-              allPets.push({
-                deviceId: device.deviceId,
-                petName: deviceOwnerMap[device.deviceId]?.petName || 'Unnamed Pet',
-                petType: deviceOwnerMap[device.deviceId]?.petType || 'Unknown',
-                petBreed: deviceOwnerMap[device.deviceId]?.petBreed || 'Unknown',
-                userId: deviceOwnerMap[device.deviceId]?.userId,
-                ownerName: deviceOwnerMap[device.deviceId]?.ownerName || `User ${deviceOwnerMap[device.deviceId]?.userId}`,
-                lat: device.lat,
-                lng: device.lng,
-                isTrigger: false
-              });
-            });
-
-            nearbyPetsData = {
-              type: 'individual',
-              involvedUsers: involvedUserIds,
-              pets: allPets
-            };
-          }
-
-          // Notify all involved users
-          involvedUserIds.forEach(userId => {
-            console.log(`📱 Notifying user ${userId} about nearby pets (${nearbyPetsData.type})`);
-            io.to(userId).emit("nearby-pets", nearbyPetsData);
-          });
-        }
-      } catch (nearbyError) {
-        console.error(`❌ Error processing nearby pets detection:`, nearbyError.message);
+    // Detect nearby pets using user-configured radius from cached settings (only if we have a userId)
+    if (data.userId) {
+      // Initialize global tracking object for nearby pets if it doesn't exist
+      if (!global.lastNearbyPetsState) {
+        global.lastNearbyPetsState = {};
       }
+
+      // Get the last state for this device (which pets were already detected nearby)
+      if (!global.lastNearbyPetsState[data.deviceId]) {
+        global.lastNearbyPetsState[data.deviceId] = [];
+      }
+
+      const currentPet = {
+        lat: data.lat,
+        lng: data.lng,
+        userId: data.userId,
+        deviceId: data.deviceId,
+      };
+
+      const otherPets = Object.entries(latestDevices)
+        .filter(([deviceId]) => deviceId !== data.deviceId)
+        .map(([deviceId, device]) => ({
+          deviceId,
+          lat: device.lat,
+          lng: device.lng,
+          userId: device.userId,
+        }));
+
+      // Get the user's configured detection radius from SMS settings
+      let detectionRadius = 10; // Default if no settings found
+      try {
+        // Use retry logic for this query
+        const userSettings = await queryWithRetry(
+          pool,
+          `SELECT meter_radius FROM sms_notification_settings WHERE user_id = ?`,
+          [data.userId]
+        );
+        
+        if (userSettings.length > 0 && userSettings[0].meter_radius) {
+          detectionRadius = parseInt(userSettings[0].meter_radius) || 10;
+          console.log(
+            `📏 Using configured detection radius: ${detectionRadius}m for user ${data.userId}`
+          );
+        } else {
+          console.log(
+            `📏 Using default detection radius: ${detectionRadius}m for user ${data.userId}`
+          );
+        }
+      } catch (radiusError) {
+        console.error(`❌ Error getting detection radius for user ${data.userId}:`, radiusError.message);
+        console.log(
+          `📏 Using default detection radius: ${detectionRadius}m for user ${data.userId}`
+        );
+      }
+
+      const nearbyPetsResult = detectNearbyPets(
+        currentPet,
+        otherPets,
+        detectionRadius
+      );
+
+      if (nearbyPetsResult.length > 0) {
+        try {
+          // Get owner information for all involved devices (current + nearby)
+          const nearbyDeviceIds = nearbyPetsResult.map((pet) => pet.deviceId);
+          const allDeviceIds = [data.deviceId, ...nearbyDeviceIds];
+
+          // Use retry logic for owner information query
+          const ownerInfo = await queryWithRetry(
+            pool,
+            `SELECT t.device_id, t.user_id, t.pet_name, t.pet_type, t.pet_breed, u.first_name, u.last_name, u.email 
+             FROM trackers t 
+             JOIN users u ON t.user_id = u.user_id 
+             WHERE t.device_id IN (?)`,
+            [allDeviceIds]
+          );
+
+          // Group devices by their owners
+          const ownerGroups = {};
+          const deviceOwnerMap = {};
+
+          ownerInfo.forEach((tracker) => {
+            const userId = tracker.user_id;
+            const deviceId = tracker.device_id;
+            const petName = tracker.pet_name || "Unnamed Pet";
+            const petType = tracker.pet_type || "Unknown";
+            const petBreed = tracker.pet_breed || "Unknown";
+            const ownerName =
+              `${tracker.first_name || ""} ${tracker.last_name || ""}`.trim() ||
+              tracker.email ||
+              `User ${userId}`;
+
+            // Get coordinates for this device
+            const deviceCoords =
+              deviceId === data.deviceId
+                ? { lat: data.lat, lng: data.lng }
+                : nearbyPetsResult.find((pet) => pet.deviceId === deviceId);
+
+            deviceOwnerMap[deviceId] = {
+              userId,
+              petName,
+              petType,
+              petBreed,
+              ownerName,
+            };
+
+            if (!ownerGroups[userId]) {
+              ownerGroups[userId] = [];
+            }
+            ownerGroups[userId].push({
+              deviceId,
+              petName,
+              petType,
+              petBreed,
+              lat: deviceCoords?.lat,
+              lng: deviceCoords?.lng,
+              owner: { userId, petName, petType, petBreed, ownerName },
+            });
+          });
+
+          // Get unique user IDs involved
+          const involvedUserIds = Object.keys(ownerGroups);
+
+          if (involvedUserIds.length > 1) {
+            // Only notify if pets from different owners are nearby
+            console.log(
+              `🐾 Nearby pets detected from different owners (within ${detectionRadius}m):`,
+              ownerGroups
+            );
+
+            // Determine if we should group pets or treat them individually
+            const shouldGroupPets = Object.values(ownerGroups).some(
+              (pets) => pets.length > 1
+            );
+
+            let nearbyPetsData;
+
+            if (shouldGroupPets) {
+              // Group format: when multiple pets from same owner(s) are involved
+              nearbyPetsData = {
+                type: "grouped",
+                involvedUsers: involvedUserIds,
+                ownerGroups: ownerGroups,
+                triggerDevice: {
+                  deviceId: data.deviceId,
+                  owner: deviceOwnerMap[data.deviceId],
+                  lat: data.lat,
+                  lng: data.lng,
+                },
+                nearbyDevices: nearbyPetsResult.map((pet) => ({
+                  deviceId: pet.deviceId,
+                  lat: pet.lat,
+                  lng: pet.lng,
+                  owner: deviceOwnerMap[pet.deviceId],
+                })),
+              };
+            } else {
+              const allPets = [];
+
+              allPets.push({
+                deviceId: data.deviceId,
+                petName:
+                  deviceOwnerMap[data.deviceId]?.petName || "Unnamed Pet",
+                petType: deviceOwnerMap[data.deviceId]?.petType || "Unknown",
+                petBreed: deviceOwnerMap[data.deviceId]?.petBreed || "Unknown",
+                userId: deviceOwnerMap[data.deviceId]?.userId,
+                ownerName:
+                  deviceOwnerMap[data.deviceId]?.ownerName ||
+                  `User ${deviceOwnerMap[data.deviceId]?.userId}`,
+                lat: data.lat,
+                lng: data.lng,
+                isTrigger: true,
+              });
+
+              nearbyPetsResult.forEach((pet) => {
+                allPets.push({
+                  deviceId: pet.deviceId,
+                  petName:
+                    deviceOwnerMap[pet.deviceId]?.petName || "Unnamed Pet",
+                  petType: deviceOwnerMap[pet.deviceId]?.petType || "Unknown",
+                  petBreed: deviceOwnerMap[pet.deviceId]?.petBreed || "Unknown",
+                  userId: deviceOwnerMap[pet.deviceId]?.userId,
+                  ownerName:
+                    deviceOwnerMap[pet.deviceId]?.ownerName ||
+                    `User ${deviceOwnerMap[pet.deviceId]?.userId}`,
+                  lat: pet.lat,
+                  lng: pet.lng,
+                  isTrigger: false,
+                });
+              });
+
+              nearbyPetsData = {
+                type: "individual",
+                involvedUsers: involvedUserIds,
+                pets: allPets,
+              };
+            }
+
+            // Create a global tracking for nearby pet interactions, not just per device
+      if (!global.nearbyPetsInteractions) {
+        global.nearbyPetsInteractions = {};
+      }
+      
+      // Create a unique interaction ID by sorting and joining all involved device IDs
+      // This ensures we treat the same group of pets as one interaction regardless of which device reports
+      const allInvolvedDeviceIds = [...nearbyDeviceIds, data.deviceId].sort();
+      const interactionKey = allInvolvedDeviceIds.join(',');
+      
+      // Check if this exact combination of nearby pets has been notified before
+      const hasNotifiedBefore = global.nearbyPetsInteractions[interactionKey] === true;
+      
+      // Always emit the socket event for real-time UI updates
+      involvedUserIds.forEach((userId) => {
+        io.to(userId).emit("nearby-pets", nearbyPetsData);
+      });
+      
+      // Only send notifications and SMS if this is a new nearby pets combination
+      if (!hasNotifiedBefore) {
+        // Mark this combination as notified
+        global.nearbyPetsInteractions[interactionKey] = true;
+        
+        console.log(`✨ New nearby pets interaction detected (${interactionKey}), sending notifications`);
+        
+        let userSettings = {};
+        try {
+          const userSettingsResult = await queryWithRetry(
+            pool,
+            `SELECT u.user_id, u.phone, s.nearby_pet as nearby_pet_enabled 
+             FROM users u
+             LEFT JOIN sms_notification_settings s ON u.user_id = s.user_id
+             WHERE u.user_id IN (?)`,
+            [involvedUserIds]
+          );
+          
+          userSettingsResult.forEach(user => {
+            userSettings[user.user_id] = {
+              phoneNumber: user.phone,
+              nearbyPetsEnabled: user.nearby_pet_enabled === 1
+            };
+          });
+          
+          console.log(`📊 Retrieved settings for ${Object.keys(userSettings).length} users`);
+        } catch (settingsError) {
+          console.error(`❌ Error getting user notification settings:`, settingsError.message);
+        }
+        
+        for (const userId of involvedUserIds) {
+
+          let notificationMessage = "";
+          const currentUserPets = ownerGroups[userId] || [];
+          const otherOwners = involvedUserIds.filter(id => id !== userId);
+          
+          const userPetNames = currentUserPets.map(pet => pet.petName).join(", ");
+          
+          const nearbyPetsCount = Object.entries(ownerGroups)
+            .filter(([ownerId]) => ownerId !== userId)
+            .reduce((total, [_, pets]) => total + pets.length, 0);
+          
+          if (nearbyPetsCount === 1) {
+            const otherPet = Object.values(ownerGroups)
+              .flat()
+              .find(pet => pet.owner.userId !== userId);
+              
+            notificationMessage = `${userPetNames} is near ${otherPet.petName} (${otherPet.petType || 'pet'})`;
+          } else {
+            notificationMessage = `${userPetNames} is near ${nearbyPetsCount} other pets`;
+          }
+          
+          await notificationHelper.createNotification(
+            io,
+            userId,
+            data.deviceId,
+            notificationMessage,
+            "normal"
+          );
+          
+          console.log(
+            `📱 Notifying user ${userId} about nearby pets (${nearbyPetsData.type})`
+          );
+          
+          try {
+            const userSetting = userSettings[userId] || {};
+            console.log(`🔎 Checking nearby pets SMS notification settings for user ${userId}`);
+            
+            const notificationEnabled = userSetting.nearbyPetsEnabled || 
+              await isNotificationEnabled(pool, userId, "nearby_pet");
+            
+            if (!notificationEnabled) {
+              console.log(
+                `ℹ️ User ${userId} has disabled SMS notifications for nearby pets events`
+              );
+              continue;
+            }
+            
+            const phoneNumber = userSetting.phoneNumber || 
+              (await getTrackerOwnerPhone(pool, ownerGroups[userId][0].deviceId)).phoneNumber;
+            
+            if (!phoneNumber) {
+              console.warn(
+                `⚠️ No valid phone number for user ${userId}, skipping SMS notification`
+              );
+              continue;
+            }
+            
+            const userPetNames = currentUserPets.map(pet => pet.petName).join(", ");
+            const otherOwnerPets = Object.entries(ownerGroups)
+              .filter(([ownerId]) => ownerId !== userId)
+              .map(([_, pets]) => pets)
+              .flat();
+            
+            let smsMessage = "";
+            if (otherOwnerPets.length === 1) {
+              smsMessage = `${userPetNames} is near ${otherOwnerPets[0].petName} (${otherOwnerPets[0].petType || 'pet'}) within ${detectionRadius}m. Time: ${new Date().toLocaleString()}`;
+            } else {
+              smsMessage = `${userPetNames} is near ${otherOwnerPets.length} other pets within ${detectionRadius}m. Time: ${new Date().toLocaleString()}`;
+            }
+            
+            console.log(
+              `📱 Sending SMS for nearby pets detection to ${phoneNumber}`
+            );
+            
+            const smsResponse = await sendSMS(
+              phoneNumber,
+              smsMessage
+            );
+            
+            console.log(`✅ SMS sent for nearby pets`, smsResponse);
+          } catch (smsError) {
+            console.error(
+              `❌ Failed to send SMS for nearby pets to user ${userId}:`,
+              smsError.message
+            );
+          }
+        }
+            } else {
+              console.log(`ℹ️ Interaction between pets already notified before (${interactionKey}), skipping notifications and SMS`);
+            }
+          }
+        } catch (nearbyError) {
+          console.error(
+            `❌ Error processing nearby pets detection:`,
+            nearbyError.message
+          );
+        }
+      } else {
+        const previousNearby = global.lastNearbyPetsState[data.deviceId] || [];
+        if (previousNearby.length > 0) {
+          console.log(`📍 Pets are no longer nearby for device ${data.deviceId}`);
+          global.lastNearbyPetsState[data.deviceId] = [];
+          
+          // (OPTIONAL: ADD FEATURE IF NEARBY PETS IS NO LONGER NEARBY)
+        }
+      }
+    } else {
+      console.log(
+        `ℹ️ Skipping nearby pets detection for unassigned device ${data.deviceId}`
+      );
     }
 
     console.log("📥 Received from device:", data);
     broadcastDevices();
     res.status(200).send("✅ Data received");
   } catch (err) {
-    console.error("❌ Error handling /data:", err);
-    res.status(500).send("Server error");
+    const isConnectionError = 
+      err.code === 'ECONNRESET' || 
+      err.code === 'PROTOCOL_CONNECTION_LOST' ||
+      err.code === 'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR' ||
+      err.code === 'ETIMEDOUT';
+    
+    console.error("❌ Error handling /data:", {
+      message: err.message,
+      code: err.code || 'unknown',
+      isConnectionError,
+      stack: err.stack
+    });
+    
+    if (isConnectionError) {
+      console.log("🔄 Responding with temporary error for connection issue - device should retry");
+      res.status(503).send("Database connection error - please retry");
+    } else {
+      res.status(500).send("Server error");
+    }
   } finally {
-    if (connection) connection.release();
+    if (connection) {
+      try {
+        connection.release();
+      } catch (releaseError) {
+        console.warn("⚠️ Error releasing connection:", releaseError.message);
+      }
+    }
   }
 });
 
@@ -693,7 +1087,7 @@ setInterval(() => {
         let connection;
         try {
           connection = await pool.getConnection();
-          
+
           // TRACKER LAST KNOWN DATA
           await connection.query(
             `UPDATE trackers 
@@ -701,80 +1095,107 @@ setInterval(() => {
          WHERE device_id = ?`,
             [info.battery ?? null, info.lat ?? null, info.lng ?? null, deviceId]
           );
-          console.log(`📦 Saved last known data for ${deviceId} (Battery: ${info.battery}%)`);
-          
+          console.log(
+            `📦 Saved last known data for ${deviceId} (Battery: ${info.battery}%)`
+          );
+
           // TRACKER OWNER
           const [trackers] = await connection.query(
-            `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`, 
+            `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
             [deviceId]
           );
-          
+
           // CREATE NONTIF
           for (const tracker of trackers) {
             const petName = tracker.pet_name || "Your pet";
             const message = `${petName}'s tracker (${deviceId}) has gone OFFLINE`;
-            
+
             await notificationHelper.createNotification(
               io,
-              tracker.user_id, 
-              deviceId, 
+              tracker.user_id,
+              deviceId,
               message,
-              'offline'
+              "offline"
             );
           }
-          
+
           // SMS NOTIFICATION FOR DEVICE OFFLINE STATUS
           try {
             for (const tracker of trackers) {
               const userId = tracker.user_id;
-              
-              console.log(`🔎 Checking offline notification settings for user ${userId} and device ${deviceId}`);
-              
-              // Get raw notification settings first to debug
+
+              console.log(
+                `🔎 Checking offline notification settings for user ${userId} and device ${deviceId}`
+              );
+
+              // RAW NOTIFICATION SETTINGS
               let settingsConn = await pool.getConnection();
               const [settings] = await settingsConn.query(
-                `SELECT * FROM sms_notification_settings WHERE user_id = ?`, 
+                `SELECT * FROM sms_notification_settings WHERE user_id = ?`,
                 [userId]
               );
               settingsConn.release();
-              
+
               if (settings.length > 0) {
-                console.log(`📋 Raw settings from database for user ${userId}:`, JSON.stringify(settings[0]));
+                console.log(
+                  `📋 Raw settings from database for user ${userId}:`,
+                  JSON.stringify(settings[0])
+                );
               } else {
                 console.log(`⚠️ No SMS settings found for user ${userId}`);
                 continue;
               }
-              
-              const notificationEnabled = await isNotificationEnabled(pool, userId, 'offline');
-              
+
+              const notificationEnabled = await isNotificationEnabled(
+                pool,
+                userId,
+                "offline"
+              );
+
               if (!notificationEnabled) {
-                console.log(`ℹ️ User ${userId} has disabled SMS notifications for offline events`);
+                console.log(
+                  `ℹ️ User ${userId} has disabled SMS notifications for offline events`
+                );
                 continue;
               } else {
-                console.log(`✅ User ${userId} has enabled SMS notifications for offline events`);
+                console.log(
+                  `✅ User ${userId} has enabled SMS notifications for offline events`
+                );
               }
-              
-              const { phoneNumber } = await getTrackerOwnerPhone(pool, deviceId);
-              
+
+              const { phoneNumber } = await getTrackerOwnerPhone(
+                pool,
+                deviceId
+              );
+
               if (!phoneNumber) {
-                console.warn(`⚠️ No valid phone number for user ${userId}, skipping SMS notification`);
+                console.warn(
+                  `⚠️ No valid phone number for user ${userId}, skipping SMS notification`
+                );
                 continue;
               }
-              
+
               const petName = tracker.pet_name || "Your pet";
-              console.log(`📱 Sending SMS notification for ${deviceId} going offline to ${phoneNumber}`);
-              
+              console.log(
+                `📱 Sending SMS notification for ${deviceId} going offline to ${phoneNumber}`
+              );
+
               const smsResponse = await sendSMS(
                 phoneNumber,
                 `${petName}'s tracker (${deviceId}) has gone OFFLINE. Time: ${new Date().toLocaleString()}`
               );
-              
-              console.log(`✅ SMS notification sent for offline device ${deviceId}`, smsResponse);
+
+              console.log(
+                `✅ SMS notification sent for offline device ${deviceId}`,
+                smsResponse
+              );
             }
           } catch (smsError) {
-            console.error(`❌ Failed to send SMS notification for offline device:`, smsError.message);
+            console.error(
+              `❌ Failed to send SMS notification for offline device:`,
+              smsError.message
+            );
           }
-
         } catch (err) {
           console.error(
             `❌ Failed to process offline device ${deviceId}:`,
@@ -793,13 +1214,13 @@ setInterval(() => {
 // SIMULATION LOGIC
 let simulationIntervals = {};
 let simulatedDevices = {};
-const MEETUP_POINT = { lat: 8.092, lng: 123.490 };
+const MEETUP_POINT = { lat: 8.092, lng: 123.49 };
 
 function startSimulation(deviceId, batteryOverride = null) {
   if (simulationIntervals[deviceId]) return;
 
   const angle = Math.random() * 2 * Math.PI;
-  const distance = 0.0005 + Math.random() * 0.0005; 
+  const distance = 0.0005 + Math.random() * 0.0005;
   simulatedDevices[deviceId] = {
     angle,
     position: {
@@ -815,7 +1236,7 @@ function startSimulation(deviceId, batteryOverride = null) {
     const dy = MEETUP_POINT.lat - device.position.lat;
     const distanceToMeetup = Math.sqrt(dx * dx + dy * dy);
 
-    const speed = 0.00002; 
+    const speed = 0.00002;
     device.position.lng += (dx / distanceToMeetup) * speed;
     device.position.lat += (dy / distanceToMeetup) * speed;
 
@@ -826,7 +1247,6 @@ function startSimulation(deviceId, batteryOverride = null) {
       lat: device.position.lat,
       lng: device.position.lng,
       battery: batteryLevel,
-      userId: "demo-user", // Default user for simulation
     };
 
     try {
@@ -884,6 +1304,9 @@ app.post("/api/trackers", async (req, res) => {
     if (!device_id || !user_id || !pet_name || !pet_type || !pet_breed) {
       return res.status(400).json({ message: "Missing required fields" });
     }
+    
+    // Cache the device-user relationship to avoid DB lookups
+    cacheDeviceUser(device_id, user_id);
 
     let imageBuffer = null;
     if (pet_image && typeof pet_image === "string") {
@@ -956,7 +1379,7 @@ app.put("/api/update-tracker", async (req, res) => {
       const base64Data = petImage.includes("base64,")
         ? petImage.split("base64,")[1]
         : petImage;
-      
+
       imageBuffer = Buffer.from(base64Data, "base64");
     }
 
@@ -975,30 +1398,30 @@ app.put("/api/update-tracker", async (req, res) => {
                   pet_name = ?, 
                   pet_type = ?, 
                   pet_breed = ?`;
-    
+
     let params = [petName, petType, petBreed];
-    
+
     if (imageBuffer !== null) {
       query += `, pet_image = ?`;
       params.push(imageBuffer);
     }
-    
+
     query += ` WHERE device_id = ? AND user_id = ?`;
     params.push(deviceId, userId);
 
     const [result] = await connection.query(query, params);
-    
+
     if (result.affectedRows > 0) {
       console.log(`✅ Updated tracker ${deviceId} for user ${userId}`);
-      return res.status(200).json({ 
+      return res.status(200).json({
         message: "Tracker updated successfully",
-        success: true 
+        success: true,
       });
     } else {
       console.log(`⚠️ No changes made to tracker ${deviceId}`);
-      return res.status(200).json({ 
+      return res.status(200).json({
         message: "No changes were made to the tracker",
-        success: true
+        success: true,
       });
     }
   } catch (err) {
@@ -1015,14 +1438,21 @@ app.delete("/api/trackers/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
     const userId = req.body?.userId || req.query?.userId;
-    
-    console.log("DELETE tracker request:", { deviceId, userId, 
-      bodyUserId: req.body?.userId, 
-      queryUserId: req.query?.userId 
+
+    console.log("DELETE tracker request:", {
+      deviceId,
+      userId,
+      bodyUserId: req.body?.userId,
+      queryUserId: req.query?.userId,
     });
+    
+    // Clear this device from the cache when it's deleted
+    clearCachedDevice(deviceId);
 
     if (!deviceId || !userId) {
-      return res.status(400).json({ message: "Device ID and User ID are required" });
+      return res
+        .status(400)
+        .json({ message: "Device ID and User ID are required" });
     }
 
     connection = await pool.getConnection();
@@ -1033,7 +1463,9 @@ app.delete("/api/trackers/:deviceId", async (req, res) => {
     );
 
     if (trackerExists.length === 0) {
-      return res.status(404).json({ message: "Tracker not found or doesn't belong to this user" });
+      return res
+        .status(404)
+        .json({ message: "Tracker not found or doesn't belong to this user" });
     }
 
     await connection.query(
@@ -1042,29 +1474,29 @@ app.delete("/api/trackers/:deviceId", async (req, res) => {
     );
 
     const [deleteResult] = await connection.query(
-      "DELETE FROM trackers WHERE device_id = ? AND user_id = ?", 
+      "DELETE FROM trackers WHERE device_id = ? AND user_id = ?",
       [deviceId, userId]
     );
 
     if (deleteResult.affectedRows > 0) {
       console.log(`✅ Deleted tracker ${deviceId} for user ${userId}`);
-      return res.status(200).json({ 
+      return res.status(200).json({
         message: "Tracker deleted successfully",
-        success: true 
+        success: true,
       });
     } else {
       console.log(`⚠️ No tracker found to delete with ID ${deviceId}`);
-      return res.status(404).json({ 
+      return res.status(404).json({
         message: "No tracker found to delete",
-        success: false
+        success: false,
       });
     }
   } catch (err) {
     console.error("❌ Error deleting tracker:", err);
     console.error("Error stack:", err.stack);
-    return res.status(500).json({ 
+    return res.status(500).json({
       message: "Failed to delete tracker",
-      error: err.message
+      error: err.message,
     });
   } finally {
     if (connection) connection.release();
@@ -1431,7 +1863,7 @@ app.post("/api/send-verification-code", async (req, res) => {
       "INSERT INTO verification_codes (user_id, email, code, created_at) VALUES (?, ?, ?, NOW())",
       [userId, email, code]
     );
-    
+
     console.log(`📧 Verification code sent for ${email}`);
 
     await transporter.sendMail({
@@ -1525,17 +1957,20 @@ app.post("/api/send-sms-verification-code", async (req, res) => {
   try {
     console.log("📞 SMS verification request received:", {
       body: req.body,
-      headers: req.headers['content-type'],
+      headers: req.headers["content-type"],
       url: req.url,
-      method: req.method
+      method: req.method,
     });
-    
+
     const { phone, userId } = req.body;
 
     if (!phone || !userId) {
-      console.log("❌ Missing required fields:", { phone: !!phone, userId: !!userId });
-      return res.status(400).json({ 
-        message: "Phone number and user ID are required" 
+      console.log("❌ Missing required fields:", {
+        phone: !!phone,
+        userId: !!userId,
+      });
+      return res.status(400).json({
+        message: "Phone number and user ID are required",
       });
     }
 
@@ -1554,14 +1989,14 @@ app.post("/api/send-sms-verification-code", async (req, res) => {
     console.log(`🔢 Generated OTP code: ${customCode} for user ${userId}`);
 
     let formattedPhone = phone;
-    if (formattedPhone.startsWith('63')) {
+    if (formattedPhone.startsWith("63")) {
       formattedPhone = phone;
-    } else if (formattedPhone.startsWith('09')) {
-      formattedPhone = '63' + phone.substring(1);
-    } else if (formattedPhone.startsWith('9')) {
-      formattedPhone = '63' + phone;
+    } else if (formattedPhone.startsWith("09")) {
+      formattedPhone = "63" + phone.substring(1);
+    } else if (formattedPhone.startsWith("9")) {
+      formattedPhone = "63" + phone;
     }
-    
+
     console.log(`📱 Formatted phone: ${phone} -> ${formattedPhone}`);
 
     await connection.query(
@@ -1575,32 +2010,35 @@ app.post("/api/send-sms-verification-code", async (req, res) => {
     );
 
     const message = "Your Pet Tracker verification code is: {otp}.";
-    console.log(`📱 Sending SMS to ${formattedPhone} with message: "${message}" and customCode: ${customCode}`);
+    console.log(
+      `📱 Sending SMS to ${formattedPhone} with message: "${message}" and customCode: ${customCode}`
+    );
     const result = await sendOTPSMS(formattedPhone, message, customCode);
 
     if (result.success) {
-      console.log(`📱 SMS verification code sent to ${formattedPhone} for user ${userId}`);
+      console.log(
+        `📱 SMS verification code sent to ${formattedPhone} for user ${userId}`
+      );
       return res.status(200).json({
         message: "SMS verification code sent successfully",
         otpCode: customCode,
-        messageId: result.messageId
+        messageId: result.messageId,
       });
     } else {
-
       await connection.query(
         "DELETE FROM sms_verification_codes WHERE user_id = ? AND code = ?",
         [userId, customCode]
       );
-      
+
       return res.status(500).json({
         message: "Failed to send SMS verification code",
-        error: result.error
+        error: result.error,
       });
     }
   } catch (err) {
     console.error("❌ Error sending SMS verification code:", err.message);
-    return res.status(500).json({ 
-      message: "Server error while sending SMS verification code" 
+    return res.status(500).json({
+      message: "Server error while sending SMS verification code",
     });
   } finally {
     if (connection) connection.release();
@@ -1614,66 +2052,58 @@ app.post("/api/verify-sms-code", async (req, res) => {
     const { userId, phone, code } = req.body;
 
     if (!userId || !phone || !code) {
-      return res.status(400).json({ 
-        message: "User ID, phone number, and code are required" 
+      return res.status(400).json({
+        message: "User ID, phone number, and code are required",
       });
     }
 
     if (!validateOTPCode(code, 6)) {
-      return res.status(400).json({ 
-        message: "Invalid code format. Code must be 6 digits." 
+      return res.status(400).json({
+        message: "Invalid code format. Code must be 6 digits.",
       });
     }
 
     connection = await pool.getConnection();
 
-    // The phone parameter here could be in various formats:
-    // - Original user format (e.g., 09XXXXXXXXX)
-    // - Already formatted (e.g., 639XXXXXXXXX)
-    // We need to match what was stored in the database during SMS sending
-    
     console.log(`🔍 SMS Verification Debug:`, {
       originalPhone: phone,
       userId: userId,
-      code: code
+      code: code,
     });
 
-    // First, try to find with the original phone format
     let [rows] = await connection.query(
       "SELECT sms_verification_id, created_at FROM sms_verification_codes WHERE user_id = ? AND phone = ? AND code = ?",
       [userId, phone, code]
     );
 
-    // If not found, try with formatted phone (639XXXXXXXXX format)
     if (rows.length === 0) {
       let formattedPhone = phone;
-      if (!formattedPhone.startsWith('63')) {
-        if (formattedPhone.startsWith('09')) {
-          formattedPhone = '63' + phone.substring(1);
-        } else if (formattedPhone.startsWith('9')) {
-          formattedPhone = '63' + phone;
+      if (!formattedPhone.startsWith("63")) {
+        if (formattedPhone.startsWith("09")) {
+          formattedPhone = "63" + phone.substring(1);
+        } else if (formattedPhone.startsWith("9")) {
+          formattedPhone = "63" + phone;
         } else {
-          formattedPhone = '63' + phone;
+          formattedPhone = "63" + phone;
         }
       }
-      
+
       [rows] = await connection.query(
         "SELECT sms_verification_id, created_at FROM sms_verification_codes WHERE user_id = ? AND phone = ? AND code = ?",
         [userId, formattedPhone, code]
       );
-      
+
       console.log(`🔍 Tried formatted phone:`, {
         formattedPhone: formattedPhone,
-        rowsFound: rows.length
+        rowsFound: rows.length,
       });
     }
 
     console.log(`🔍 Database query result:`, {
       rowsFound: rows.length,
-      searchCriteria: { userId, phone, code }
+      searchCriteria: { userId, phone, code },
     });
 
-    // Also check what's actually in the database for this user
     const [allCodes] = await connection.query(
       "SELECT phone, code FROM sms_verification_codes WHERE user_id = ?",
       [userId]
@@ -1681,8 +2111,8 @@ app.post("/api/verify-sms-code", async (req, res) => {
     console.log(`🔍 All codes for user ${userId}:`, allCodes);
 
     if (rows.length === 0) {
-      return res.status(400).json({ 
-        message: "Invalid or expired verification code" 
+      return res.status(400).json({
+        message: "Invalid or expired verification code",
       });
     }
 
@@ -1697,13 +2127,13 @@ app.post("/api/verify-sms-code", async (req, res) => {
     );
 
     console.log(`✅ SMS verified for user ${userId} with phone ${phone}`);
-    return res.status(200).json({ 
-      message: "Phone number verified successfully" 
+    return res.status(200).json({
+      message: "Phone number verified successfully",
     });
   } catch (err) {
     console.error("❌ Error verifying SMS code:", err.message);
-    return res.status(500).json({ 
-      message: "Server error while verifying SMS code" 
+    return res.status(500).json({
+      message: "Server error while verifying SMS code",
     });
   } finally {
     if (connection) connection.release();
@@ -1840,7 +2270,7 @@ app.post("/api/user-profile", async (req, res) => {
 
     const user = rows[0];
     if (user.profile_photo) {
-      user.profile_photo = user.profile_photo.toString('base64');
+      user.profile_photo = user.profile_photo.toString("base64");
     }
 
     return res.status(200).json({ user });
@@ -1860,14 +2290,14 @@ app.post("/api/user-profile", async (req, res) => {
 app.put("/api/user-profile", async (req, res) => {
   let connection;
   try {
-    const { 
-      user_id, 
-      first_name, 
-      last_name, 
-      phone, 
-      email, 
-      username, 
-      profile_photo 
+    const {
+      user_id,
+      first_name,
+      last_name,
+      phone,
+      email,
+      username,
+      profile_photo,
     } = req.body;
 
     if (!user_id) {
@@ -1897,7 +2327,8 @@ app.put("/api/user-profile", async (req, res) => {
         const duplicate = duplicates[0];
         let message = "";
         if (duplicate.email === email) message = "Email already exists";
-        if (duplicate.username === username) message = "Username already exists";
+        if (duplicate.username === username)
+          message = "Username already exists";
         return res.status(409).json({ message });
       }
     }
@@ -1928,9 +2359,11 @@ app.put("/api/user-profile", async (req, res) => {
     }
     if (profile_photo !== undefined) {
       updateFields.push("profile_photo = ?");
-      // Convert base64 to buffer if profile_photo is provided, otherwise set to null
       if (profile_photo && typeof profile_photo === "string") {
-        const base64Data = profile_photo.replace(/^data:image\/[a-z]+;base64,/, "");
+        const base64Data = profile_photo.replace(
+          /^data:image\/[a-z]+;base64,/,
+          ""
+        );
         updateValues.push(Buffer.from(base64Data, "base64"));
       } else {
         updateValues.push(null);
@@ -1943,8 +2376,10 @@ app.put("/api/user-profile", async (req, res) => {
 
     updateValues.push(user_id);
 
-    const updateQuery = `UPDATE users SET ${updateFields.join(", ")} WHERE user_id = ?`;
-    
+    const updateQuery = `UPDATE users SET ${updateFields.join(
+      ", "
+    )} WHERE user_id = ?`;
+
     const [result] = await connection.query(updateQuery, updateValues);
 
     if (result.affectedRows === 0) {
@@ -1959,12 +2394,12 @@ app.put("/api/user-profile", async (req, res) => {
 
     const user = updatedUser[0];
     if (user.profile_photo) {
-      user.profile_photo = user.profile_photo.toString('base64');
+      user.profile_photo = user.profile_photo.toString("base64");
     }
 
-    return res.status(200).json({ 
-      message: "Profile updated successfully", 
-      user 
+    return res.status(200).json({
+      message: "Profile updated successfully",
+      user,
     });
   } catch (err) {
     console.error("User profile update error:", err.message);
@@ -1983,22 +2418,22 @@ app.get("/api/notifications", async (req, res) => {
   let connection;
   try {
     const userId = req.query.userId;
-    
+
     connection = await pool.getConnection();
-    
+
     let query = `SELECT notification_id as id, user_id, device_id, message, created_at, is_read 
                 FROM notifications`;
-    
+
     const params = [];
     if (userId) {
       query += ` WHERE user_id = ?`;
       params.push(userId);
     }
-    
+
     query += ` ORDER BY created_at DESC LIMIT 50`;
-    
+
     const [notifications] = await connection.query(query, params);
-    
+
     return res.status(200).json(notifications);
   } catch (err) {
     console.error("❌ Error fetching notifications:", err.message);
@@ -2013,18 +2448,20 @@ app.put("/api/notifications/:notificationId/read", async (req, res) => {
   let connection;
   try {
     const { notificationId } = req.params;
-    
+
     connection = await pool.getConnection();
-    
+
     await connection.query(
       `UPDATE notifications SET is_read = 1 WHERE notification_id = ?`,
       [notificationId]
     );
-    
+
     return res.status(200).json({ message: "Notification marked as read" });
   } catch (err) {
     console.error("❌ Error marking notification as read:", err.message);
-    return res.status(500).json({ message: "Failed to mark notification as read" });
+    return res
+      .status(500)
+      .json({ message: "Failed to mark notification as read" });
   } finally {
     if (connection) connection.release();
   }
@@ -2035,23 +2472,27 @@ app.put("/api/notifications/mark-all-read", async (req, res) => {
   let connection;
   try {
     const userId = req.query.userId;
-    
+
     connection = await pool.getConnection();
-    
+
     let query = `UPDATE notifications SET is_read = 1`;
     const params = [];
-    
+
     if (userId) {
       query += ` WHERE user_id = ?`;
       params.push(userId);
     }
-    
+
     await connection.query(query, params);
-    
-    return res.status(200).json({ message: "All notifications marked as read" });
+
+    return res
+      .status(200)
+      .json({ message: "All notifications marked as read" });
   } catch (err) {
     console.error("❌ Error marking all notifications as read:", err.message);
-    return res.status(500).json({ message: "Failed to mark all notifications as read" });
+    return res
+      .status(500)
+      .json({ message: "Failed to mark all notifications as read" });
   } finally {
     if (connection) connection.release();
   }
@@ -2062,19 +2503,19 @@ app.delete("/api/notifications/clear-all", async (req, res) => {
   let connection;
   try {
     const userId = req.query.userId;
-    
+
     connection = await pool.getConnection();
-    
+
     let query = `DELETE FROM notifications`;
     const params = [];
-    
+
     if (userId) {
       query += ` WHERE user_id = ?`;
       params.push(userId);
     }
-    
+
     await connection.query(query, params);
-    
+
     return res.status(200).json({ message: "All notifications cleared" });
   } catch (err) {
     console.error("❌ Error clearing notifications:", err.message);
@@ -2108,7 +2549,9 @@ app.post("/api/sms-notification-settings/:userId", async (req, res) => {
     );
 
     if (existing.length > 0) {
-      return res.status(409).json({ message: "SMS notification settings already exist for this user" });
+      return res.status(409).json({
+        message: "SMS notification settings already exist for this user",
+      });
     }
 
     await connection.query(
@@ -2127,10 +2570,14 @@ app.post("/api/sms-notification-settings/:userId", async (req, res) => {
       ]
     );
 
-    res.status(201).json({ message: "SMS notification settings created successfully" });
+    res
+      .status(201)
+      .json({ message: "SMS notification settings created successfully" });
   } catch (err) {
     console.error("❌ Error creating SMS notification settings:", err.message);
-    res.status(500).json({ message: "Failed to create SMS notification settings" });
+    res
+      .status(500)
+      .json({ message: "Failed to create SMS notification settings" });
   } finally {
     if (connection) connection.release();
   }
@@ -2154,7 +2601,9 @@ app.get("/api/sms-notification-settings/:userId", async (req, res) => {
     res.status(200).json(rows);
   } catch (err) {
     console.error("❌ Error fetching SMS notification settings:", err.message);
-    res.status(500).json({ message: "Failed to fetch SMS notification settings" });
+    res
+      .status(500)
+      .json({ message: "Failed to fetch SMS notification settings" });
   } finally {
     if (connection) connection.release();
   }
@@ -2195,10 +2644,14 @@ app.put("/api/sms-notification-settings/:userId", async (req, res) => {
       ]
     );
 
-    res.status(200).json({ message: "SMS notification settings updated successfully" });
+    res
+      .status(200)
+      .json({ message: "SMS notification settings updated successfully" });
   } catch (err) {
     console.error("❌ Error updating SMS notification settings:", err.message);
-    res.status(500).json({ message: "Failed to update SMS notification settings" });
+    res
+      .status(500)
+      .json({ message: "Failed to update SMS notification settings" });
   } finally {
     if (connection) connection.release();
   }

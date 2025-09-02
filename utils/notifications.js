@@ -1,7 +1,7 @@
 const mysql = require("mysql2/promise");
 require("dotenv").config();
 
-// Get the MySQL connection pool from server.js or create a new one
+// MYSQL POOL
 let pool;
 
 /**
@@ -31,7 +31,7 @@ async function createNotification(io, userId, deviceId, message, soundType = 'no
   try {
     connection = await pool.getConnection();
     
-    // Save to database
+    // SAVE TO DATABASE
     const [result] = await connection.query(
       `INSERT INTO notifications (user_id, device_id, message, created_at, is_read) 
        VALUES (?, ?, ?, NOW(), 0)`,
@@ -40,7 +40,7 @@ async function createNotification(io, userId, deviceId, message, soundType = 'no
     
     const notificationId = result.insertId;
     
-    // Prepare notification object
+    // NOTIFICATION OBJECT
     const notification = {
       id: notificationId,
       user_id: userId,
@@ -51,7 +51,7 @@ async function createNotification(io, userId, deviceId, message, soundType = 'no
       sound_type: soundType 
     };
     
-    // Emit only to the specific user's room
+    // EMIT ONLY TO SPECIFIC ROOM
     io.to(userId.toString()).emit('notification', notification);
     
     console.log(`📢 Notification created and emitted: ${message}`);
