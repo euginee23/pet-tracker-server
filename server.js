@@ -75,7 +75,7 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-const CHECK_INTERVAL = 15000;
+const CHECK_INTERVAL = 30000;
 let latestDevices = {};
 let deviceStatus = {};
 
@@ -93,7 +93,6 @@ function getAllDevicesWithStatus() {
 
 async function broadcastDevices() {
   try {
-    // Get all connected socket IDs and their user IDs
     const sockets = await io.fetchSockets();
 
     for (const socket of sockets) {
@@ -113,7 +112,7 @@ async function broadcastDevices() {
   }
 }
 
-// Helper function to get user-specific devices
+// GET USER SPECIFIC DEVICES
 async function getUserDevices(userId) {
   try {
     const connection = await pool.getConnection();
@@ -146,7 +145,6 @@ async function getUserDevices(userId) {
 io.on("connection", async (socket) => {
   console.log("🔌 Client connected via Socket.IO");
 
-  // Extract userId from query parameters or authentication
   const userId = socket.handshake.query.userId;
   if (!userId) {
     console.error("❌ Missing userId in Socket.IO connection");
@@ -154,11 +152,9 @@ io.on("connection", async (socket) => {
     return;
   }
 
-  // Join the user-specific room
   socket.join(userId);
   console.log(`🔒 User ${userId} joined their room`);
 
-  // Send only the user's devices to the connected user
   try {
     const userDevices = await getUserDevices(userId);
     socket.emit("devices", userDevices);
@@ -509,7 +505,6 @@ app.post("/data", async (req, res) => {
                 `🔎 Checking geofence entry notification settings for user ${userId}`
               );
 
-              // Get raw notification settings first to debug
               let settingsConn = await pool.getConnection();
               const [settings] = await settingsConn.query(
                 `SELECT * FROM sms_notification_settings WHERE user_id = ?`,
@@ -601,7 +596,6 @@ app.post("/data", async (req, res) => {
                 `🔎 Checking geofence exit notification settings for user ${userId}`
               );
 
-              // Get raw notification settings first to debug
               let settingsConn = await pool.getConnection();
               const [settings] = await settingsConn.query(
                 `SELECT * FROM sms_notification_settings WHERE user_id = ?`,
@@ -680,14 +674,11 @@ app.post("/data", async (req, res) => {
       global.lastGeofenceState[data.deviceId] = insideGeofences;
     }
 
-    // Detect nearby pets using user-configured radius from cached settings (only if we have a userId)
     if (data.userId) {
-      // Initialize global tracking object for nearby pets if it doesn't exist
       if (!global.lastNearbyPetsState) {
         global.lastNearbyPetsState = {};
       }
 
-      // Get the last state for this device (which pets were already detected nearby)
       if (!global.lastNearbyPetsState[data.deviceId]) {
         global.lastNearbyPetsState[data.deviceId] = [];
       }
@@ -708,10 +699,8 @@ app.post("/data", async (req, res) => {
           userId: device.userId,
         }));
 
-      // Get the user's configured detection radius from SMS settings
-      let detectionRadius = 10; // Default if no settings found
+      let detectionRadius = 10; 
       try {
-        // Use retry logic for this query
         const userSettings = await queryWithRetry(
           pool,
           `SELECT meter_radius FROM sms_notification_settings WHERE user_id = ?`,
@@ -743,11 +732,9 @@ app.post("/data", async (req, res) => {
 
       if (nearbyPetsResult.length > 0) {
         try {
-          // Get owner information for all involved devices (current + nearby)
           const nearbyDeviceIds = nearbyPetsResult.map((pet) => pet.deviceId);
           const allDeviceIds = [data.deviceId, ...nearbyDeviceIds];
 
-          // Use retry logic for owner information query
           const ownerInfo = await queryWithRetry(
             pool,
             `SELECT t.device_id, t.user_id, t.pet_name, t.pet_type, t.pet_breed, u.first_name, u.last_name, u.email 
@@ -757,7 +744,6 @@ app.post("/data", async (req, res) => {
             [allDeviceIds]
           );
 
-          // Group devices by their owners
           const ownerGroups = {};
           const deviceOwnerMap = {};
 
@@ -772,7 +758,6 @@ app.post("/data", async (req, res) => {
               tracker.email ||
               `User ${userId}`;
 
-            // Get coordinates for this device
             const deviceCoords =
               deviceId === data.deviceId
                 ? { lat: data.lat, lng: data.lng }
@@ -800,17 +785,14 @@ app.post("/data", async (req, res) => {
             });
           });
 
-          // Get unique user IDs involved
           const involvedUserIds = Object.keys(ownerGroups);
 
           if (involvedUserIds.length > 1) {
-            // Only notify if pets from different owners are nearby
             console.log(
               `🐾 Nearby pets detected from different owners (within ${detectionRadius}m):`,
               ownerGroups
             );
 
-            // Determine if we should group pets or treat them individually
             const shouldGroupPets = Object.values(ownerGroups).some(
               (pets) => pets.length > 1
             );
@@ -818,7 +800,6 @@ app.post("/data", async (req, res) => {
             let nearbyPetsData;
 
             if (shouldGroupPets) {
-              // Group format: when multiple pets from same owner(s) are involved
               nearbyPetsData = {
                 type: "grouped",
                 involvedUsers: involvedUserIds,
@@ -878,27 +859,20 @@ app.post("/data", async (req, res) => {
               };
             }
 
-            // Create a global tracking for nearby pet interactions, not just per device
       if (!global.nearbyPetsInteractions) {
         global.nearbyPetsInteractions = {};
       }
       
-      // Create a unique interaction ID by sorting and joining all involved device IDs
-      // This ensures we treat the same group of pets as one interaction regardless of which device reports
       const allInvolvedDeviceIds = [...nearbyDeviceIds, data.deviceId].sort();
       const interactionKey = allInvolvedDeviceIds.join(',');
       
-      // Check if this exact combination of nearby pets has been notified before
       const hasNotifiedBefore = global.nearbyPetsInteractions[interactionKey] === true;
       
-      // Always emit the socket event for real-time UI updates
       involvedUserIds.forEach((userId) => {
         io.to(userId).emit("nearby-pets", nearbyPetsData);
       });
       
-      // Only send notifications and SMS if this is a new nearby pets combination
       if (!hasNotifiedBefore) {
-        // Mark this combination as notified
         global.nearbyPetsInteractions[interactionKey] = true;
         
         console.log(`✨ New nearby pets interaction detected (${interactionKey}), sending notifications`);
