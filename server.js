@@ -1183,7 +1183,7 @@ setInterval(() => {
   }
 
   broadcastDevices();
-}, 5000);
+}, 20000);
 
 // SIMULATION LOGIC
 let simulationIntervals = {};
@@ -1420,7 +1420,6 @@ app.delete("/api/trackers/:deviceId", async (req, res) => {
       queryUserId: req.query?.userId,
     });
     
-    // Clear this device from the cache when it's deleted
     clearCachedDevice(deviceId);
 
     if (!deviceId || !userId) {
@@ -2173,7 +2172,7 @@ app.post("/api/login", async (req, res) => {
     connection = await pool.getConnection();
 
     const [rows] = await connection.query(
-      "SELECT user_id, first_name, last_name, email, phone, username, password FROM users WHERE email = ? OR username = ?",
+      "SELECT user_id, first_name, last_name, email, phone, username, password, account_type FROM users WHERE email = ? OR username = ?",
       [identifier, identifier]
     );
 
@@ -2207,6 +2206,7 @@ app.post("/api/login", async (req, res) => {
         email: user.email,
         phone: user.phone || "",
         username: user.username,
+        account_type: user.account_type || null,
       },
     });
   } catch (err) {
