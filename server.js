@@ -303,7 +303,16 @@ app.post("/data", async (req, res) => {
               phoneNumber,
               `⚠️ ALERT: ${petName}'s tracker battery is low (${
                 data.battery
-              }%). Please charge soon. Time: ${new Date().toLocaleString()}`
+              }%). Please charge soon. Time: ${new Date().toLocaleString('en-US', { 
+                timeZone: 'Asia/Manila', 
+                year: 'numeric', 
+                month: '2-digit', 
+                day: '2-digit', 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit',
+                hour12: true 
+              })}`
             );
 
             console.log(`✅ SMS sent for low battery`, smsResponse);
@@ -411,7 +420,16 @@ app.post("/data", async (req, res) => {
               phoneNumber,
               `${petName}'s tracker (${
                 data.deviceId
-              }) is now ONLINE. Time: ${new Date().toLocaleString()}`
+              }) is now ONLINE. Time: ${new Date().toLocaleString('en-US', { 
+                timeZone: 'Asia/Manila', 
+                year: 'numeric', 
+                month: '2-digit', 
+                day: '2-digit', 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit',
+                hour12: true 
+              })}`
             );
 
             console.log(
@@ -557,7 +575,16 @@ app.post("/data", async (req, res) => {
 
               const smsResponse = await sendSMS(
                 phoneNumber,
-                `${petName} has ENTERED the "${geofenceName}" geofence zone. Time: ${new Date().toLocaleString()}`
+                `${petName} has ENTERED the "${geofenceName}" geofence zone. Time: ${new Date().toLocaleString('en-US', { 
+                  timeZone: 'Asia/Manila', 
+                  year: 'numeric', 
+                  month: '2-digit', 
+                  day: '2-digit', 
+                  hour: '2-digit', 
+                  minute: '2-digit', 
+                  second: '2-digit',
+                  hour12: true 
+                })}`
               );
 
               console.log(`✅ SMS sent for geofence entry`, smsResponse);
@@ -648,7 +675,16 @@ app.post("/data", async (req, res) => {
 
               const smsResponse = await sendSMS(
                 phoneNumber,
-                `⚠️ ALERT: ${petName} has LEFT the "${geofenceName}" geofence zone! Time: ${new Date().toLocaleString()}`
+                `⚠️ ALERT: ${petName} has LEFT the "${geofenceName}" geofence zone! Time: ${new Date().toLocaleString('en-US', { 
+                  timeZone: 'Asia/Manila', 
+                  year: 'numeric', 
+                  month: '2-digit', 
+                  day: '2-digit', 
+                  hour: '2-digit', 
+                  minute: '2-digit', 
+                  second: '2-digit',
+                  hour12: true 
+                })}`
               );
 
               console.log(`✅ SMS sent for geofence exit`, smsResponse);
@@ -966,9 +1002,27 @@ app.post("/data", async (req, res) => {
             
             let smsMessage = "";
             if (otherOwnerPets.length === 1) {
-              smsMessage = `${userPetNames} is near ${otherOwnerPets[0].petName} (${otherOwnerPets[0].petType || 'pet'}) within ${detectionRadius}m. Time: ${new Date().toLocaleString()}`;
+              smsMessage = `${userPetNames} is near ${otherOwnerPets[0].petName} (${otherOwnerPets[0].petType || 'pet'}) within ${detectionRadius}m. Time: ${new Date().toLocaleString('en-US', { 
+                timeZone: 'Asia/Manila', 
+                year: 'numeric', 
+                month: '2-digit', 
+                day: '2-digit', 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit',
+                hour12: true 
+              })}`;
             } else {
-              smsMessage = `${userPetNames} is near ${otherOwnerPets.length} other pets within ${detectionRadius}m. Time: ${new Date().toLocaleString()}`;
+              smsMessage = `${userPetNames} is near ${otherOwnerPets.length} other pets within ${detectionRadius}m. Time: ${new Date().toLocaleString('en-US', { 
+                timeZone: 'Asia/Manila', 
+                year: 'numeric', 
+                month: '2-digit', 
+                day: '2-digit', 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit',
+                hour12: true 
+              })}`;
             }
             
             console.log(
@@ -1154,12 +1208,19 @@ setInterval(() => {
                 `📱 Sending SMS notification for ${deviceId} going offline to ${phoneNumber}`
               );
 
-              const smsResponse = await sendSMS(
-                phoneNumber,
-                `${petName}'s tracker (${deviceId}) has gone OFFLINE. Time: ${new Date().toLocaleString()}`
-              );
-
-              console.log(
+            const smsResponse = await sendSMS(
+              phoneNumber,
+              `${petName}'s tracker (${deviceId}) has gone OFFLINE. Time: ${new Date().toLocaleString('en-US', { 
+                timeZone: 'Asia/Manila', 
+                year: 'numeric', 
+                month: '2-digit', 
+                day: '2-digit', 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit',
+                hour12: true 
+              })}`
+            );              console.log(
                 `✅ SMS notification sent for offline device ${deviceId}`,
                 smsResponse
               );
