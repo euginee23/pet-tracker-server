@@ -79,6 +79,110 @@ const CHECK_INTERVAL = 30000;
 let latestDevices = {};
 let deviceStatus = {};
 
+// TRAIL HISTORY BATCHING SYSTEM
+const BATCH_SIZE = 5;
+let trailBatches = {}; // Store batches by tracker_id
+
+const saveTrailBatch = async (trackerId, batch) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    
+    // Prepare batch insert
+    const insertValues = batch.map(entry => [
+      trackerId,
+      entry.start_lat,
+      entry.start_lng,
+      entry.end_lat,
+      entry.end_lng,
+      entry.created_at
+    ]);
+
+    await connection.query(
+      `INSERT INTO trail_history (tracker_id, start_lat, start_lng, end_lat, end_lng, created_at) VALUES ?`,
+      [insertValues]
+    );
+
+    console.log(`✅ Saved ${batch.length} trail entries for tracker ${trackerId}`);
+  } catch (error) {
+    console.error(`❌ Error saving trail batch for tracker ${trackerId}:`, error.message);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+const addToTrailBatch = async (trackerId, startLat, startLng, endLat, endLng) => {
+  // Initialize batch for tracker if it doesn't exist
+  if (!trailBatches[trackerId]) {
+    trailBatches[trackerId] = [];
+    console.log(`🆕 Initialized new batch for tracker ${trackerId}`);
+  }
+
+  // Add new trail entry to batch
+  trailBatches[trackerId].push({
+    start_lat: startLat,
+    start_lng: startLng,
+    end_lat: endLat,
+    end_lng: endLng,
+    created_at: new Date()
+  });
+
+  const currentBatchSize = trailBatches[trackerId].length;
+  console.log(`📝 Added trail entry to ${trackerId} batch (${currentBatchSize}/${BATCH_SIZE})`);
+
+  // Check if batch is full
+  if (currentBatchSize >= BATCH_SIZE) {
+    const batch = [...trailBatches[trackerId]]; // Copy the batch
+    trailBatches[trackerId] = []; // Clear the batch
+    
+    console.log(`💾 Batch full for ${trackerId}, saving ${batch.length} entries to database`);
+    // Save batch asynchronously
+    await saveTrailBatch(trackerId, batch);
+  }
+};
+
+// Flush all remaining batches (for server shutdown or periodic cleanup)
+const flushAllTrailBatches = async () => {
+  const trackerIds = Object.keys(trailBatches);
+  const flushPromises = [];
+
+  for (const trackerId of trackerIds) {
+    if (trailBatches[trackerId].length > 0) {
+      const batch = [...trailBatches[trackerId]];
+      trailBatches[trackerId] = [];
+      flushPromises.push(saveTrailBatch(trackerId, batch));
+    }
+  }
+
+  if (flushPromises.length > 0) {
+    await Promise.all(flushPromises);
+    console.log(`🔄 Flushed ${flushPromises.length} remaining trail batches`);
+  }
+};
+
+// Periodic flush for batches that haven't reached full size (every 5 minutes)
+setInterval(async () => {
+  const now = new Date();
+  const trackerIds = Object.keys(trailBatches);
+  
+  for (const trackerId of trackerIds) {
+    const batch = trailBatches[trackerId];
+    if (batch.length > 0) {
+      // Check if oldest entry is more than 5 minutes old
+      const oldestEntry = batch[0];
+      const timeDiff = now - new Date(oldestEntry.created_at);
+      const fiveMinutes = 5 * 60 * 1000;
+      
+      if (timeDiff > fiveMinutes) {
+        const batchToSave = [...batch];
+        trailBatches[trackerId] = [];
+        await saveTrailBatch(trackerId, batchToSave);
+        console.log(`⏰ Auto-flushed ${batchToSave.length} trail entries for tracker ${trackerId} (5min timeout)`);
+      }
+    }
+  }
+}, 5 * 60 * 1000); // Run every 5 minutes
+
 function getAllDevicesWithStatus() {
   const now = Date.now();
   return Object.entries(latestDevices).map(([deviceId, info]) => ({
@@ -217,6 +321,35 @@ app.post("/data", async (req, res) => {
       online: true,
       userId: data.userId,
     };
+
+    // TRAIL HISTORY BATCHING - Add movement to batch if we have previous position
+    if (prevState.lat && prevState.lng && data.lat && data.lng) {
+      // Only add to trail if the device has moved significantly (to avoid saving identical positions)
+      const latDiff = Math.abs(data.lat - prevState.lat);
+      const lngDiff = Math.abs(data.lng - prevState.lng);
+      const minMovement = 0.00001; // Minimum movement threshold
+      
+      console.log(`🚶 ${data.deviceId} movement check: latDiff=${latDiff.toFixed(6)}, lngDiff=${lngDiff.toFixed(6)}, threshold=${minMovement}`);
+      
+      if (latDiff > minMovement || lngDiff > minMovement) {
+        console.log(`✅ ${data.deviceId} moved significantly, adding to trail batch`);
+        try {
+          await addToTrailBatch(
+            data.deviceId, 
+            prevState.lat, 
+            prevState.lng, 
+            data.lat, 
+            data.lng
+          );
+        } catch (trailError) {
+          console.error(`❌ Error adding to trail batch for ${data.deviceId}:`, trailError.message);
+        }
+      } else {
+        console.log(`📍 ${data.deviceId} movement too small, skipping trail batch`);
+      }
+    } else {
+      console.log(`🔍 ${data.deviceId} - Missing previous or current position for trail batching`);
+    }
 
     if (
       data.battery !== undefined &&
@@ -1251,50 +1384,97 @@ let simulationIntervals = {};
 let simulatedDevices = {};
 const MEETUP_POINT = { lat: 8.092, lng: 123.49 };
 
-function startSimulation(deviceId, batteryOverride = null) {
+function startSimulation(deviceId, batteryOverride = null, movementType = 'random') {
   if (simulationIntervals[deviceId]) return;
 
   const angle = Math.random() * 2 * Math.PI;
-  const distance = 0.0005 + Math.random() * 0.0005;
-  simulatedDevices[deviceId] = {
-    angle,
-    position: {
-      lat: MEETUP_POINT.lat + Math.cos(angle) * distance,
-      lng: MEETUP_POINT.lng + Math.sin(angle) * distance,
-    },
-  };
-
-  simulationIntervals[deviceId] = setInterval(async () => {
-    const device = simulatedDevices[deviceId];
-
-    const dx = MEETUP_POINT.lng - device.position.lng;
-    const dy = MEETUP_POINT.lat - device.position.lat;
-    const distanceToMeetup = Math.sqrt(dx * dx + dy * dy);
-
-    const speed = 0.00002;
-    device.position.lng += (dx / distanceToMeetup) * speed;
-    device.position.lat += (dy / distanceToMeetup) * speed;
-
-    const batteryLevel = batteryOverride ?? Math.floor(50 + Math.random() * 50);
-
-    const payload = {
-      deviceId,
-      lat: device.position.lat,
-      lng: device.position.lng,
-      battery: batteryLevel,
+  
+  if (movementType === 'random') {
+    // Random movement simulation
+    simulatedDevices[deviceId] = {
+      angle,
+      position: {
+        lat: 8.090881 + Math.random() * 0.002,
+        lng: 123.488679 + Math.random() * 0.002,
+      },
+      movementType: 'random'
     };
 
-    try {
-      await axios.post(process.env.SERVER_URL + `/data`, payload);
-    } catch (err) {
-      console.error(
-        `❌ Failed to send simulated data for ${deviceId}:`,
-        err.message
-      );
-    }
-  }, 5000);
+    simulationIntervals[deviceId] = setInterval(async () => {
+      const device = simulatedDevices[deviceId];
+      device.angle += (Math.random() - 0.5) * 0.4;
 
-  console.log(`▶️ Started simulation for ${deviceId}`);
+      const speed = 0.000015;
+      const dx = Math.cos(device.angle) * speed;
+      const dy = Math.sin(device.angle) * speed;
+
+      device.position.lat += dy;
+      device.position.lng += dx;
+
+      const batteryLevel = batteryOverride ?? Math.floor(50 + Math.random() * 50);
+
+      const payload = {
+        deviceId,
+        lat: device.position.lat,
+        lng: device.position.lng,
+        battery: batteryLevel,
+      };
+
+      try {
+        await axios.post(`${process.env.SERVER_URL}/data`, payload);
+      } catch (err) {
+        console.error(
+          `❌ Failed to send simulated data for ${deviceId}:`,
+          err.message
+        );
+      }
+    }, 5000);
+
+    console.log(`▶️ Started random movement simulation for ${deviceId}`);
+  } else if (movementType === 'centerpoint') {
+    // Center point movement simulation
+    const distance = 0.0005 + Math.random() * 0.0005;
+    simulatedDevices[deviceId] = {
+      angle,
+      position: {
+        lat: MEETUP_POINT.lat + Math.cos(angle) * distance,
+        lng: MEETUP_POINT.lng + Math.sin(angle) * distance,
+      },
+      movementType: 'centerpoint'
+    };
+
+    simulationIntervals[deviceId] = setInterval(async () => {
+      const device = simulatedDevices[deviceId];
+
+      const dx = MEETUP_POINT.lng - device.position.lng;
+      const dy = MEETUP_POINT.lat - device.position.lat;
+      const distanceToMeetup = Math.sqrt(dx * dx + dy * dy);
+
+      const speed = 0.00002;
+      device.position.lng += (dx / distanceToMeetup) * speed;
+      device.position.lat += (dy / distanceToMeetup) * speed;
+
+      const batteryLevel = batteryOverride ?? Math.floor(50 + Math.random() * 50);
+
+      const payload = {
+        deviceId,
+        lat: device.position.lat,
+        lng: device.position.lng,
+        battery: batteryLevel,
+      };
+
+      try {
+        await axios.post(process.env.SERVER_URL + `/data`, payload);
+      } catch (err) {
+        console.error(
+          `❌ Failed to send simulated data for ${deviceId}:`,
+          err.message
+        );
+      }
+    }, 5000);
+
+    console.log(`▶️ Started center point simulation for ${deviceId}`);
+  }
 }
 
 function stopSimulation(deviceId) {
@@ -1308,7 +1488,7 @@ function stopSimulation(deviceId) {
 
 // SIMULATE MULTIPLE DEVICES
 app.post("/simulate-movement", (req, res) => {
-  const { deviceIds, start = true, battery = null } = req.body;
+  const { deviceIds, start = true, battery = null, movementType = 'random' } = req.body;
 
   if (!Array.isArray(deviceIds) || deviceIds.length === 0) {
     return res
@@ -1316,10 +1496,17 @@ app.post("/simulate-movement", (req, res) => {
       .json({ message: "deviceIds must be a non-empty array" });
   }
 
+  // Validate movement type
+  if (!['random', 'centerpoint'].includes(movementType)) {
+    return res
+      .status(400)
+      .json({ message: "movementType must be either 'random' or 'centerpoint'" });
+  }
+
   if (start) {
-    deviceIds.forEach((id) => startSimulation(id, battery));
+    deviceIds.forEach((id) => startSimulation(id, battery, movementType));
     return res.status(200).json({
-      message: `Started simulation for: ${deviceIds.join(", ")}`,
+      message: `Started ${movementType} simulation for: ${deviceIds.join(", ")}`,
     });
   } else {
     deviceIds.forEach((id) => stopSimulation(id));
@@ -2692,13 +2879,230 @@ app.put("/api/sms-notification-settings/:userId", async (req, res) => {
   }
 });
 
+// GET TRAIL HISTORY FOR A TRACKER
+app.get("/api/trail-history/:trackerId", async (req, res) => {
+  let connection;
+  try {
+    const { trackerId } = req.params;
+    const { from, to } = req.query;
+
+    if (!trackerId) {
+      return res.status(400).json({ message: "Tracker ID is required" });
+    }
+
+    if (!from || !to) {
+      return res.status(400).json({ message: "From and To datetime are required" });
+    }
+
+    connection = await pool.getConnection();
+
+    console.log(`🔍 Searching for trails - Tracker: ${trackerId}, From: ${from}, To: ${to}`);
+    
+    // Convert datetime-local format to MySQL format
+    const fromMySQL = from.replace('T', ' ') + ':00';
+    const toMySQL = to.replace('T', ' ') + ':00';
+    
+    console.log(`🔄 Converted times - From: ${fromMySQL}, To: ${toMySQL}`);
+    
+    // First, let's check if the table exists and has any data
+    const [tableCheck] = await connection.query(`SHOW TABLES LIKE 'trail_history'`);
+    if (tableCheck.length === 0) {
+      console.log("❌ trail_history table does not exist!");
+      return res.status(500).json({ message: "Trail history table not found" });
+    }
+
+    // Check total records in trail_history table
+    const [totalCount] = await connection.query(`SELECT COUNT(*) as total FROM trail_history`);
+    console.log(`📊 Total trail records in database: ${totalCount[0].total}`);
+
+    // Check records for this specific tracker
+    const [trackerCount] = await connection.query(
+      `SELECT COUNT(*) as count FROM trail_history WHERE tracker_id = ?`,
+      [trackerId]
+    );
+    console.log(`📊 Trail records for tracker ${trackerId}: ${trackerCount[0].count}`);
+
+    // Check records in the specific time range
+    const [rangeCount] = await connection.query(
+      `SELECT COUNT(*) as count FROM trail_history WHERE tracker_id = ? AND created_at BETWEEN ? AND ?`,
+      [trackerId, fromMySQL, toMySQL]
+    );
+    console.log(`📊 Trail records in time range: ${rangeCount[0].count}`);
+    
+    // Let's also see the earliest and latest records for this tracker
+    const [timeRange] = await connection.query(
+      `SELECT MIN(created_at) as earliest, MAX(created_at) as latest FROM trail_history WHERE tracker_id = ?`,
+      [trackerId]
+    );
+    console.log(`📅 Tracker ${trackerId} time range: ${timeRange[0].earliest} to ${timeRange[0].latest}`);
+
+    // Get trail history within the specified time range
+    const [trails] = await connection.query(
+      `SELECT start_lat, start_lng, end_lat, end_lng, created_at 
+       FROM trail_history 
+       WHERE tracker_id = ? AND created_at BETWEEN ? AND ? 
+       ORDER BY created_at ASC`,
+      [trackerId, fromMySQL, toMySQL]
+    );
+
+    // Process trails to create connected paths
+    let trailPaths = [];
+    if (trails.length > 0) {
+      for (let i = 0; i < trails.length; i++) {
+        const trail = trails[i];
+        trailPaths.push([
+          [parseFloat(trail.start_lat), parseFloat(trail.start_lng)],
+          [parseFloat(trail.end_lat), parseFloat(trail.end_lng)]
+        ]);
+      }
+    }
+
+    // Get current tracker position to connect trail to current location
+    const [currentTracker] = await connection.query(
+      `SELECT last_lat, last_lng FROM trackers WHERE device_id = ?`,
+      [trackerId]
+    );
+
+    let currentPosition = null;
+    if (currentTracker.length > 0 && currentTracker[0].last_lat && currentTracker[0].last_lng) {
+      currentPosition = [
+        parseFloat(currentTracker[0].last_lat),
+        parseFloat(currentTracker[0].last_lng)
+      ];
+    }
+
+    console.log(`✅ Retrieved ${trails.length} trail segments for tracker ${trackerId}`);
+    
+    return res.status(200).json({
+      trails: trailPaths,
+      currentPosition: currentPosition,
+      totalSegments: trails.length,
+      timeRange: { from, to },
+      debugInfo: {
+        totalRecordsInDB: totalCount[0].total,
+        recordsForThisTracker: trackerCount[0].count,
+        recordsInTimeRange: rangeCount[0].count,
+        originalQuery: { from, to },
+        convertedQuery: { fromMySQL, toMySQL },
+        trackerTimeRange: timeRange[0]
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ Error fetching trail history:", err.message);
+    return res.status(500).json({ message: "Failed to fetch trail history" });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// DEBUG ENDPOINT: Get batch status and manually flush batches
+app.get("/api/trail-batch-status", (req, res) => {
+  const batchStatus = {};
+  for (const [trackerId, batch] of Object.entries(trailBatches)) {
+    batchStatus[trackerId] = {
+      pendingEntries: batch.length,
+      oldestEntry: batch.length > 0 ? batch[0].created_at : null,
+      newestEntry: batch.length > 0 ? batch[batch.length - 1].created_at : null
+    };
+  }
+  
+  res.json({
+    batchSize: BATCH_SIZE,
+    currentBatches: batchStatus,
+    totalTrackers: Object.keys(trailBatches).length
+  });
+});
+
+// DEBUG ENDPOINT: Manually flush all batches (for testing)
+app.post("/api/flush-trail-batches", async (req, res) => {
+  try {
+    await flushAllTrailBatches();
+    res.json({ message: "All trail batches flushed successfully" });
+  } catch (error) {
+    console.error("❌ Error flushing batches:", error.message);
+    res.status(500).json({ message: "Failed to flush batches", error: error.message });
+  }
+});
+
+// DEBUG ENDPOINT: Create test trail data
+app.post("/api/create-test-trails/:trackerId", async (req, res) => {
+  const { trackerId } = req.params;
+  const { count = 10 } = req.body;
+  
+  try {
+    const basePosition = {
+      lat: 8.090881,
+      lng: 123.488679
+    };
+    
+    console.log(`🧪 Creating ${count} test trail entries for ${trackerId}`);
+    
+    // Generate test trail movements
+    for (let i = 0; i < count; i++) {
+      const startLat = basePosition.lat + (Math.random() - 0.5) * 0.01;
+      const startLng = basePosition.lng + (Math.random() - 0.5) * 0.01;
+      const endLat = startLat + (Math.random() - 0.5) * 0.002;
+      const endLng = startLng + (Math.random() - 0.5) * 0.002;
+      
+      await addToTrailBatch(trackerId, startLat, startLng, endLat, endLng);
+      
+      // Small delay to make timestamps different
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    
+    // Flush any remaining batch
+    await flushAllTrailBatches();
+    
+    res.json({ 
+      message: `Created ${count} test trail entries for ${trackerId}`,
+      trackerId: trackerId,
+      count: count
+    });
+  } catch (error) {
+    console.error("❌ Error creating test trails:", error.message);
+    res.status(500).json({ message: "Failed to create test trails", error: error.message });
+  }
+});
+
 // ROOT
 app.get("/", (req, res) => {
   res.send("📡 HTTP + Socket.IO Pet Tracker running");
 });
 
+// GRACEFUL SHUTDOWN HANDLING
+const gracefulShutdown = async (signal) => {
+  console.log(`\n🛑 Received ${signal}. Starting graceful shutdown...`);
+  
+  // Flush all remaining trail batches
+  try {
+    await flushAllTrailBatches();
+    console.log('✅ All trail batches flushed successfully');
+  } catch (error) {
+    console.error('❌ Error flushing trail batches during shutdown:', error.message);
+  }
+  
+  // Close server
+  server.close(() => {
+    console.log('🔌 Server closed');
+    process.exit(0);
+  });
+  
+  // Force exit after 10 seconds
+  setTimeout(() => {
+    console.log('⚠️ Forcing exit after 10 seconds');
+    process.exit(1);
+  }, 10000);
+};
+
+// Listen for shutdown signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGUSR2', () => gracefulShutdown('SIGUSR2')); // nodemon restart
+
 // SERVER START
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 HTTP + Socket.IO server running on port ${PORT}`);
+  console.log(`📊 Trail history batching enabled (batch size: ${BATCH_SIZE})`);
 });
