@@ -28,6 +28,7 @@ const {
   clearCachedDevice
 } = require("./utils/deviceCache");
 const { executeWithRetry, queryWithRetry } = require("./utils/dbRetry");
+const trackerHistory = require("./utils/trackerHistory");
 
 const app = express();
 const server = http.createServer(app);
@@ -61,6 +62,7 @@ const pool = mysql.createPool({
     console.log("✅ Successfully connected to the database.");
     connection.release();
     notificationHelper.initialize(pool);
+    trackerHistory.initialize(pool);
   } catch (err) {
     console.error("❌ Error connecting to the database:", err.message || err);
   }
@@ -476,6 +478,18 @@ app.post("/data", async (req, res) => {
         );
         connection.release();
 
+        // Save tracker history for ONLINE status
+        for (const tracker of trackers) {
+          await trackerHistory.saveTrackerHistory({
+            tracker_id: data.deviceId,
+            user_id: tracker.user_id,
+            history_type: 'online',
+            lat: data.lat,
+            lng: data.lng,
+            battery: data.battery
+          });
+        }
+
         for (const tracker of trackers) {
           const petName = tracker.pet_name || "Your pet";
           const message = `${petName}'s tracker (${data.deviceId}) is now ONLINE`;
@@ -641,6 +655,16 @@ app.post("/data", async (req, res) => {
               `✅ Pet ${data.deviceId} is now inside geofence (${geofenceName})`
             );
 
+            // Save tracker history for GEOFENCE ENTRY
+            await trackerHistory.saveTrackerHistory({
+              tracker_id: data.deviceId,
+              user_id: tracker.user_id,
+              history_type: 'geofence_in',
+              lat: data.lat,
+              lng: data.lng,
+              battery: data.battery
+            });
+
             await notificationHelper.createNotification(
               io,
               tracker.user_id,
@@ -739,6 +763,16 @@ app.post("/data", async (req, res) => {
                 2
               )}m away)`
             );
+
+            // Save tracker history for GEOFENCE EXIT
+            await trackerHistory.saveTrackerHistory({
+              tracker_id: data.deviceId,
+              user_id: tracker.user_id,
+              history_type: 'geofence_out',
+              lat: data.lat,
+              lng: data.lng,
+              battery: data.battery
+            });
 
             // "LEFT GEOFENCE" NOTIFICATION
             await notificationHelper.createNotification(
@@ -1091,6 +1125,16 @@ app.post("/data", async (req, res) => {
             notificationMessage = `${userPetNames} is near ${nearbyPetsCount} other pets`;
           }
           
+          // Save tracker history for NEARBY PETS detection
+          await trackerHistory.saveTrackerHistory({
+            tracker_id: data.deviceId,
+            user_id: userId,
+            history_type: 'nearby_pets',
+            lat: data.lat,
+            lng: data.lng,
+            battery: data.battery
+          });
+
           await notificationHelper.createNotification(
             io,
             userId,
@@ -1265,6 +1309,18 @@ setInterval(() => {
             `SELECT user_id, pet_name FROM trackers WHERE device_id = ?`,
             [deviceId]
           );
+
+          // Save tracker history for OFFLINE status
+          for (const tracker of trackers) {
+            await trackerHistory.saveTrackerHistory({
+              tracker_id: deviceId,
+              user_id: tracker.user_id,
+              history_type: 'offline',
+              lat: info.lat,
+              lng: info.lng,
+              battery: info.battery
+            });
+          }
 
           // CREATE NONTIF
           for (const tracker of trackers) {
@@ -3062,6 +3118,92 @@ app.post("/api/create-test-trails/:trackerId", async (req, res) => {
   } catch (error) {
     console.error("❌ Error creating test trails:", error.message);
     res.status(500).json({ message: "Failed to create test trails", error: error.message });
+  }
+});
+
+// GET TRACKER STATUS HISTORY
+app.get("/api/tracker-history/:trackerId", async (req, res) => {
+  try {
+    const { trackerId } = req.params;
+    const { from, to, historyType, limit } = req.query;
+
+    if (!trackerId) {
+      return res.status(400).json({ message: "Tracker ID is required" });
+    }
+
+    const options = {};
+    
+    if (from) {
+      options.from = new Date(from);
+    }
+    
+    if (to) {
+      options.to = new Date(to);
+    }
+    
+    if (historyType) {
+      options.historyType = historyType;
+    }
+    
+    if (limit) {
+      options.limit = parseInt(limit);
+    }
+
+    const history = await trackerHistory.getTrackerHistory(trackerId, options);
+    
+    res.json({
+      success: true,
+      trackerId,
+      count: history.length,
+      history
+    });
+
+  } catch (error) {
+    console.error("❌ Error fetching tracker history:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch tracker history",
+      error: error.message
+    });
+  }
+});
+
+// GET RECENT TRACKER HISTORY FOR USER
+app.get("/api/tracker-history/user/:userId/recent", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { hours, limit } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({ message: "User ID is required" });
+    }
+
+    const options = {};
+    
+    if (hours) {
+      options.hours = parseInt(hours);
+    }
+    
+    if (limit) {
+      options.limit = parseInt(limit);
+    }
+
+    const history = await trackerHistory.getRecentTrackerHistory(parseInt(userId), options);
+    
+    res.json({
+      success: true,
+      userId: parseInt(userId),
+      count: history.length,
+      history
+    });
+
+  } catch (error) {
+    console.error("❌ Error fetching recent tracker history:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch recent tracker history",
+      error: error.message
+    });
   }
 });
 
